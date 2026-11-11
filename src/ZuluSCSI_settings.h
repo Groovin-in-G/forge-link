@@ -1,0 +1,287 @@
+/**
+ * ZuluSCSI™ - Copyright (c) 2023-2025 Rabbit Hole Computing™
+ * Copyright (c) 2023-2026 Eric Helgeson <eric@bluescsi.com>
+ * 
+ * This file is licensed under the GPL version 3 or any later version.  
+ * 
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ * ----
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version. 
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details. 
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+**/
+#pragma once
+#include <ZuluSCSI_platform_config.h>
+
+// must be in the same order as speed_grade_strings[]  in ZuluSCSI_settings.cpp
+typedef enum
+{
+    SPEED_GRADE_DEFAULT = 0,
+    SPEED_GRADE_MAX,
+    SPEED_GRADE_CUSTOM,
+    SPEED_GRADE_AUDIO_SPDIF,
+    SPEED_GRADE_AUDIO_I2S,
+    SPEED_GRADE_A,
+    SPEED_GRADE_B,
+    SPEED_GRADE_C,
+    SPEED_GRADE_WIFI_RM2,
+    SPEED_GRADE_BASE_203MHZ,
+    SPEED_GRADE_BASE_155MHZ,
+} zuluscsi_speed_grade_t;
+
+// Wi-Fi security mode requested by the WiFiSecurity setting.
+// WIFI_SECURITY_WPA2 must stay 0 so a zeroed S2S_BoardCfg keeps the
+// long-standing default when the setting is absent.
+// must be in the same order as wifi_security_strings[] in ZuluSCSI_settings.cpp
+typedef enum
+{
+    WIFI_SECURITY_WPA2 = 0,  // WPA/WPA2 mixed PSK, widest compatibility
+    WIFI_SECURITY_WPA2_AES,  // WPA2 AES PSK only, refuses TKIP
+    WIFI_SECURITY_WPA3,      // WPA3 SAE only
+    WIFI_SECURITY_WPA3_WPA2, // WPA3 SAE, also programming the WPA2 PSK
+} zuluscsi_wifi_security_t;
+
+
+typedef enum {
+    MASS_STORAGE_MODE_NONE,
+    MASS_STORAGE_MODE_SD,
+    MASS_STORAGE_MODE_IMAGES
+} mass_storage_mode;
+
+#ifdef __cplusplus
+
+#include <stdint.h>
+#include <stddef.h>
+#include <scsi2sd.h>
+
+
+// Index S2S_MAX_TARGETS is the system defaults
+// Index 0 to (S2S_MAX_TARGETS - 1) represent device settings
+#define SCSI_SETTINGS_SYS_IDX S2S_MAX_TARGETS
+
+typedef enum
+{
+    SYS_PRESET_NONE = 0,
+    SYS_PRESET_MAC,
+    SYS_PRESET_MACPLUS,
+    SYS_PRESET_MPC3000,
+    SYS_PRESET_MEGASTE,
+    SYS_PRESET_X68000,
+    SYS_PRESET_X68000_SCSI,
+    SYS_PRESET_X68000_SASI,
+    SYS_PRESET_DOS,
+    SYS_PRESET_NeXT,
+    SYS_PRESET_PC_9801_55,
+#ifdef PLATFORM_AS400
+    SYS_PRESET_AS400,
+    SYS_PRESET_AS400_BS520,
+    SYS_PRESET_AS400_BS522,
+    SYS_PRESET_AS400_CISC,
+    SYS_PRESET_AS400_PPC,
+#endif
+} scsi_system_preset_t;
+
+typedef enum
+{
+    DEV_PRESET_UNKNOWN = -1,
+    DEV_PRESET_NONE,
+    DEV_PRESET_ST32430N,
+#ifdef PLATFORM_AS400
+    DEV_PRESET_AS400_BS520,
+    DEV_PRESET_AS400_BS522,
+    DEV_PRESET_AS400_CISC,
+    DEV_PRESET_AS400_PPC,
+#endif
+} scsi_device_preset_t;
+
+
+// This struct should only have new settings added to the end
+// as it maybe saved and restored directly from flash memory
+typedef struct __attribute__((__packed__)) scsi_system_settings_t
+{
+    // Settings for host compatibility 
+    uint8_t quirks;
+    uint8_t selectionDelay;
+    uint8_t maxSyncSpeed;
+    uint8_t phyMode;
+    uint16_t initPreDelay;
+    uint16_t initPostDelay;
+
+    bool enableUnitAttention;
+    bool enableSCSI2;
+    bool enableSelLatch;
+    bool mapLunsToIDs;
+    bool enableParity;
+    bool useFATAllocSize;
+    bool enableCDAudio;
+    uint8_t maxVolume;
+    bool enableUSBMassStorage;
+    uint16_t usbMassStorageWaitPeriod;
+    bool usbMassStoragePresentImages;
+    
+    bool invertStatusLed;
+
+    uint8_t speedGrade; // memory allocation for zuluscsi_speed_grade_t enum
+
+    bool controlBoardDisable; // Currently not implemented
+    bool controlBoardReverseRotary;
+    bool controlBoardFlipDisplay;
+    bool controlBoardCache;
+
+    bool controlBoardDimDisplay;
+    uint16_t controlBoardScreenSaverTimeSec;
+    uint16_t controlBoardScreenSaverStyle;
+
+    uint8_t maxBusWidth;
+
+    bool initiatorParity;
+
+    int logRotate;
+
+    uint32_t wifi_keep_alive_s;
+
+    bool dumpCachedSettings;
+
+#if ENABLE_COW
+    uint16_t cowBufferSize;
+#endif
+} scsi_system_settings_t;
+
+// This struct should only have new setting added to the end
+// as it maybe saved and restored directly from flash memory
+typedef struct __attribute__((__packed__)) scsi_device_settings_t
+{
+    // Settings that can be set on all or specific device
+    int prefetchBytes;
+    uint16_t sectorsPerTrack;
+    uint16_t headsPerCylinder;
+
+    char prodId[16];
+    char serial[16];
+    char vendor[8];
+    char revision[4];
+
+    uint16_t vol;
+    uint8_t deviceType;
+    uint8_t deviceTypeModifier;
+    uint8_t ejectButton;
+    uint32_t ejectBlinkTimes;
+    uint32_t ejectBlinkPeriod;
+    bool ejectFixedDiskEnable;
+    bool ejectFixedDiskReadOnly;
+    uint32_t ejectFixedDiskDelay;
+    bool nameFromImage;
+    bool rightAlignStrings;
+    bool reinsertOnInquiry;
+    bool reinsertAfterEject;
+    bool reinsertImmediately;
+    bool ejectOnStop;
+    bool keepCurrentImageOnBusReset;
+    bool disableMacSanityCheck;
+
+    uint32_t sectorSDBegin;
+    uint32_t sectorSDEnd;
+
+    uint32_t vendorExtensions;
+
+    uint32_t blockSize;
+#if ENABLE_COW
+    uint32_t cowBitmapSize;
+    uint8_t cowButton;
+    bool cowButtonInvert;
+#endif
+    uint32_t tapeLengthMB;
+    int16_t mediumType;
+    uint8_t tapeDensity;
+    uint8_t tapeBufferedMode;
+} scsi_device_settings_t;
+
+
+class ZuluSCSISettings
+{
+public:
+    // Initialize settings for all devices with a preset configuration,
+    //  or return the default config if unknown system type.
+    // Then overwrite any settings with those in the CONFIGFILE
+    scsi_system_settings_t *initSystem(const char *presetName, bool disable_logging = false);
+
+    // Copy any shared device setting done the initSystemSettings as default settings, 
+    // or return the default config if unknown device type.
+    // Then overwrite any settings with those in the CONFIGFILE
+    scsi_device_settings_t *initDevice(uint8_t scsiId, S2S_CFG_TYPE type, bool disable_logging = false);
+    // return the system settings struct to read values
+    scsi_system_settings_t *getSystem();
+
+    // return the device settings struct to read values
+    scsi_device_settings_t *getDevice(uint8_t scsiId);
+
+    // return the system preset enum
+    scsi_system_preset_t getSystemPreset();
+
+    // return the system preset name
+    const char* getSystemPresetName();
+
+    // return the device preset enum
+    scsi_device_preset_t getDevicePreset(uint8_t scsiId);
+
+    // return the device preset name
+    const char* getDevicePresetName(uint8_t scsiId);
+
+    // convert string to speed grade
+    zuluscsi_speed_grade_t stringToSpeedGrade(const char *speed_grade_str, size_t length);
+
+    // convert string to Wi-Fi security mode
+    zuluscsi_wifi_security_t stringToWifiSecurity(const char *wifi_security_str);
+
+    const char* getSpeedGradeString();
+
+    // see if any SCSI devices have an eject button set
+    const bool isEjectButtonSet();
+
+    // Apply [SCSIn] settings as overrides on top of already-loaded [SCSI<X>] settings
+    // for the device whose ID was read from the GPIO expander.
+    // Only modifies fields that are explicitly present in the [SCSIn] section.
+    // Pass disable_logging=true to suppress the section-header and per-key log lines.
+    scsi_device_settings_t* applyDynamicSectionOverrides(uint8_t scsiId, bool disable_logging = false);
+
+protected:
+    // Set default drive vendor / product info after the image file
+    // is loaded and the device type is known.
+    void setDefaultDriveInfo(uint8_t scsiId, const char *presetName, S2S_CFG_TYPE type, bool log_settings);
+
+    // Settings for the specific device
+    const char **deviceInitST32430N(uint8_t scsiId);
+#ifdef PLATFORM_AS400
+    void deviceInitAS400(uint8_t scsiId);
+#endif
+
+    // Get the device preset enum based off of string, return DEV_PRESET_NONE if no match
+    scsi_device_preset_t getDevicePresetFromString(const char *presetName);
+
+    // Informative name of the preset configuration, or NULL for defaults
+    scsi_system_preset_t m_sysPreset;
+    // The last preset is for the device specific under [SCSI] in the CONFIGFILE
+    // The rest are for corresponding SCSI Ids e.g. [SCSI0] in the CONFIGFILE.
+    scsi_device_preset_t m_devPreset[S2S_MAX_TARGETS];
+
+    // These are setting for host compatibility
+    scsi_system_settings_t m_sys;
+
+    // The last dev will be copied over the other dev scsi Id for device defaults.
+    // It is set during when the system settings are initialized
+    scsi_device_settings_t m_dev[S2S_MAX_TARGETS+1];
+} ;
+
+
+
+extern ZuluSCSISettings g_scsi_settings;
+#endif // __cplusplus

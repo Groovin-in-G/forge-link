@@ -1,0 +1,105 @@
+/**
+ * Run "pioasm rp2350_sniffer.pio rp2350_sniffer.pio.h" to regenerate the C header from this.
+ *
+ * RP2350_Logic_Sniffer - Copyright (c) 2025-2026 Rabbit Hole Computing™
+ * 
+ * MIT License
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/* This file implements a logic sniffer functionality for RP2350.
+ * It captures the state of up to 27 signals.
+ *
+ * The captured data is run-length-encoded by a PIO state machine.
+ *
+ * Encoding of the captured data:
+ *    Bits 31..27: D (Short time delta)
+ *    Bits 26..0:  P (Pin states or long time delta)
+ *
+ * If D != 31, then P is the new state of the 27 IO pins.
+ * Clock cycles since previous sample is 3 * (32 - D)
+ *
+ * If D == 31 and P <= 0x03FFFFFF, then P is a long time delta.
+ * Pin states have not changed and clock cycles is 3 * (0x03FFFFFF - P + 3)
+ *
+ * If D == 31 and 0x03FFFFFF < P <= 0x07FFFFFE are CPU special data items (see README)
+ *
+ * If D == 31 and P == 0x07FFFFFF (whole word is all ones), then maximum time delta
+ * has passed. Clock cycles is 3 * (0x03FFFFFF + 2) (approx 1 second @ 200 MHz)
+ */
+
+.define PUBLIC SNIFFER_TRIGGER_IRQ 0
+.program rp2350_sniffer
+.pio_version 1
+.fifo rx
+.in 27 right auto 32
+.out 0 right
+
+lg_change:
+    mov y, ~null     ; Set Y to all ones
+    in x, 27         ; Load the 27 bit time delta
+    in y, 5          ; Load the top 5 bits to value 31 to indicate long time delta and autopush
+    mov x, null      ; Set time delta for the pin state push below
+
+change:
+    in pins, 27      ; Load pin states
+    irq clear SNIFFER_TRIGGER_IRQ
+    in x, 5          ; Load 5-bit time delta (value 0..30) and autopush
+
+PUBLIC init:
+    set x, 30        ; Initialize next time delta counter
+
+loop:
+    mov y, status    ; Check trigger interrupt status
+    jmp y--, change  ; If triggered, push new state
+    jmp x--, loop    ; Loop until time delta overflows
+
+    ; Time delta exceeded 30 cycles, encode as long gap
+
+    .wrap_target
+long_gap:
+    mov osr, ~null   ; Set OSR to all ones
+    out x, 26        ; Set X to 0x03FFFFFF
+
+loop_lg:
+    mov y, status    ; Check trigger interrupt status
+    jmp y--, lg_change  ; If triggered, push long timestamp and new state
+    jmp x--, loop_lg ; Loop until time delta overflows
+
+    ; Timestamp has wrapped, X is now 0xFFFFFFFF
+    in x, 32         ; Push the word that indicates long gap at maximum time delta
+    .wrap
+
+; Auxiliary state machines that monitor pins for changes to trigger the
+; sniffer. There can be up to three of these trigger machines, and each
+; can handle a continuous range of 1-27 trigger pins.
+
+.program rp2350_sniffer_trigger
+.pio_version 1
+
+change:
+    irq set SNIFFER_TRIGGER_IRQ     ; Trigger sniffer to store the pin states
+    mov y, x    [5]        ; Update Y for comparing, delay so that main SM has had time to clear IRQ
+
+.wrap_target
+wait_change:
+    mov x, pins         ; Read new pin states
+    jmp x != y, change  ; Detect change
+.wrap

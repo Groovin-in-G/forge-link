@@ -1,0 +1,228 @@
+/**
+ * ZuluSCSI™ - Copyright (c) 2022-2025 Rabbit Hole Computing™
+ * Portions copyright (c) 2023 joshua stein <jcs@jcs.org>
+ *
+ * ZuluSCSI™ firmware is licensed under the GPL version 3 or any later version.
+ *
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ * ----
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+**/
+
+// Compile-time configuration parameters.
+// Other settings can be set by ini file at runtime.
+
+#pragma once
+#include <ZuluSCSI_platform_config.h>
+
+// Use variables for version number
+#define FW_VER_NUM      "2026.09.10"
+
+// FW_VER_SUFFIX must distinguish the GD32/V1.x LTS build line from the
+// RP2040/RP2350 (RP2MCU) build line - they were unintentionally collapsed
+// onto one hardcoded value by the "Merge branch 'LTS/V1.x' into main" merge,
+// so every RP2MCU build (Wide, Blaster, Pico, etc) reported the "V1.x-LTS"
+// suffix that only ever meant anything for the GD32 boards. Before that
+// merge, RP2MCU builds correctly reported plain "release".
+#if defined(ZULUSCSI_V1_0) || defined(ZULUSCSI_V1_1_plus)
+#define FW_VER_SUFFIX   "V1.x-LTS-release"
+#else
+#define FW_VER_SUFFIX   "release"
+
+#endif
+
+#define DEF_STRINGFY(DEF) STRINGFY(DEF)
+#define STRINGFY(STR) #STR
+#define FIRMWARE_NAME_PREFIX DEF_STRINGFY(BUILD_ENV)
+#define ZULU_FW_VERSION FW_VER_NUM "-" FW_VER_SUFFIX
+// ⭐ FORGE LINK NAME STRIP (SHIP-1, 2026-10-12: strip the ZuluSCSI name before customers
+// get it). "ZuluSCSI" is Rabbit Hole Computing's trademark; everything the firmware SHOWS or WRITES says
+// Forge Link. Copyright and attribution text, source file names and C identifiers keep the original
+// name. tools/fl_release_gate.py (gate v4) refuses a ship UF2 that still carries the name outside its
+// allow-list. INQUIRY_NAME keeps upstream's 8 bytes so the INQUIRY additional-length byte is unchanged.
+#define INQUIRY_NAME  "FORGELNK"
+#define TOOLBOX_API 0
+
+// Configuration and log file paths
+// The config file: forgelink.ini is read when the card has one, else the legacy zuluscsi.ini (cards the
+// app writes today, and the bench cards'). CONFIGFILE is the name picked at the last card mount
+// (forgelink_select_configfile(), src/ForgeLink_names.cpp), so every ini_* call and the settings cache
+// agree on one file.
+#define CONFIGFILE_NEW    "forgelink.ini"
+#define CONFIGFILE_LEGACY "zuluscsi.ini"
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const char *g_fl_configfile;
+const char *forgelink_select_configfile(void);
+#ifdef __cplusplus
+}
+#endif
+#define CONFIGFILE  g_fl_configfile
+#define CONFIGFILECACHED "forgelink-cached.ini"   // write-only debug dump (DumpCachedSettings): never read back
+#define LOGFILE     "forgelink_log.txt"
+#define LOGFILEPREV "forgelink_log_prev.txt"
+#define LOGFILEROTATE "forgelink_log_rotate"
+#define LOGFILEDIR "forgelink_logs"
+
+// AS/400 disk profile definitions, captured by utils/extract_as400_disk_data.sh
+// and selected per-[SCSIn] via the AS400_DiskProfile key.
+#define AS400_PROFILES_FILE "as400_disk_definitions.txt"
+#define CRASHFILE   "forgelink_err.txt"
+#define STARTUPSOUND "zulustartup.wav"
+#define FIRMWARE_PREFIX "ForgeLink-FW"
+// SHIP-1: the SD updater's file family. A firmware file on the card is a candidate only if its name
+// starts with this (case-insensitive) AND with FIRMWARE_NAME_PREFIX (the build env, e.g.
+// ForgeLink_Blaster_unified). Both the bootloader that flashes it (find_firmware_image,
+// src/ZuluSCSI_bootloader.cpp) and the main firmware's notice (check_for_unused_update_files,
+// src/ZuluSCSI.cpp) use this one macro, so a stock ZuluSCSI*.bin on a card is never flashed.
+#define FIRMWARE_FAMILY_PREFIX "forgelink"
+#define FIRMWARE_FAMILY_MATCH(name) (strncasecmp((name), FIRMWARE_FAMILY_PREFIX, sizeof(FIRMWARE_FAMILY_PREFIX) - 1) == 0)
+
+#define ZULUCONTROL_FW_FILE "zulucontrol.uf2"
+#define ZULUCONTROL_UF2_PREFIX "zulucontrol"
+
+#define SNIFFERFILE "forgelink_sniff.dat"
+#define SNIFFERFILEPREV "forgelink_sniff_prev.dat"
+
+// Prefix for command file to create new image (case-insensitive)
+#define CREATEFILE "create"
+
+// Log buffer size in bytes, must be a power of 2
+// ⭐ FORGE LINK (N6 probe-bulk slice 2): the PROBE+BULK build halves the log ring to
+// pay for its second RX slot (two slots alone left 31,320 B free heap, under the 34,000 B floor).
+// Only that build: the injection builds and target7 unflag FORGE_LINK_PROBE and keep 16384.
+#if defined(FORGE_LINK_PROBE) && defined(FORGE_LINK_BULK) && !defined(LOGBUFSIZE)
+#define LOGBUFSIZE 8192
+#endif
+#ifndef LOGBUFSIZE
+#define LOGBUFSIZE 16384
+#endif
+#define LOG_SAVE_INTERVAL_MS 1000
+
+// How often to check for SD card presence
+#define SDCARD_POLL_INTERVAL 5000
+
+// How often to check an empty SD card for insert
+#define SDCARD_POLL_INSERT_INTERVAL 1500
+
+// How often to attempt WiFi reconnection after link loss (ms)
+#define WIFI_RECONNECT_START_INTERVAL 5000
+#define WIFI_RECONECT_MAX_INTERVAL 15000
+#define WIFI_RECONNECT_INCREMENT_INTERVAL 5000
+
+// How often to send a dummy Ethernet frame while idle, to keep the CYW43
+// radio active and give it a chance to notice/recover from an AP-initiated
+// deauth. Well under typical AP idle timeouts (commonly 300-1000s).
+#define WIFI_KEEPALIVE_INTERVAL 120
+
+// Watchdog timeout
+// Watchdog will first issue a bus reset and if that does not help, crashdump.
+#define WATCHDOG_BUS_RESET_TIMEOUT 15000
+#define WATCHDOG_CRASH_TIMEOUT 30000
+
+// HDD image file format
+#define HDIMG_ID_POS  2                 // Position to embed ID number
+#define HDIMG_LUN_POS 3                 // Position to embed LUN numbers
+#define HDIMG_BLK_POS 5                 // Position to embed block size numbers
+
+
+// The INI section [SCSIn] and image prefixes HDn/CDn/TPn/etc. apply to this device.
+// [SCSIn] settings take priority over the hardcoded [SCSI<X>] section for this ID.
+#define DYNAMIC_SCSI_INI_SECTION "SCSIn"
+#define DYNAMIC_SCSI_ID_CHAR     'n'
+
+#if defined(CONTROL_BOARD)
+#define MAX_FILE_PATH 260                // Maximum file name length
+#else
+#define MAX_FILE_PATH 64                // Maximum file name length
+#endif
+
+// Image definition options
+#define IMAGE_INDEX_MAX 99              // Maximum number of 'IMG0' - `IMG99` style statements parsed
+
+// SCSI config
+#define NUM_SCSILUN 1          // Maximum number of LUNs supported     (Currently has to be 1)
+#define READ_PARITY_CHECK 0    // Perform read parity check (unverified)
+
+// SCSI raw fallback configuration when no image files are detected
+// Presents the whole SD card as an SCSI drive
+#define RAW_FALLBACK_ENABLE 1
+#define RAW_FALLBACK_SCSI_ID 1
+#define RAW_FALLBACK_BLOCKSIZE 512
+
+// Default SCSI drive information (can be overridden in INI file)
+// Selected based on device type (fixed, removable, optical, floppy, mag-optical, tape)
+// Each entry has {vendor, product, version, serial}
+// If serial number is left empty, SD card serial number is used.
+#define DRIVEINFO_FIXED     {"FORGELNK", "HARDDRIVE", PLATFORM_REVISION, ""}
+#define DRIVEINFO_REMOVABLE {"FORGELNK", "REMOVABLE", PLATFORM_REVISION, ""}
+#define DRIVEINFO_OPTICAL   {"FORGELNK", "CDROM",     PLATFORM_REVISION, ""}
+#define DRIVEINFO_FLOPPY    {"FORGELNK", "FLOPPY",    PLATFORM_REVISION, ""}
+#define DRIVEINFO_MAGOPT    {"FORGELNK", "MO_DRIVE",  PLATFORM_REVISION, ""}
+#define DRIVEINFO_NETWORK   {"Dayna",    "SCSI/Link", "2.0f",            ""}
+#define DRIVEINFO_TAPE      {"FORGELNK", "TAPE",      PLATFORM_REVISION, ""}
+#define DRIVEINFO_AMIGAWIFI {"AmigaNET", "SCSI/Link", "1.0f", ""}
+#define DRIVEINFO_AUDIO     {"FORGELNK", "AUDIO",     PLATFORM_REVISION, ""}
+
+// Default block size
+#define DEFAULT_BLOCKSIZE 512
+
+// Default optical drive blocksize
+#define DEFAULT_BLOCKSIZE_OPTICAL 2048
+
+// Default SCSI drive information when Apple quirks are enabled
+#define APPLE_DRIVEINFO_FIXED     {"DEC",      "ForgeLink HDD",     PLATFORM_REVISION, "1.0"}
+#define APPLE_DRIVEINFO_REMOVABLE {"IOMEGA",   "BETA230",           PLATFORM_REVISION, "2.02"}
+#define APPLE_DRIVEINFO_OPTICAL   {"MATSHITA", "CD-ROM CR-8004",    PLATFORM_REVISION, "1.1f"}
+#define APPLE_DRIVEINFO_FLOPPY    {"IOMEGA",   "Io20S         *F",  "PP33",            ""}
+#define APPLE_DRIVEINFO_MAGOPT    {"MOST",     "RMD-5200",          PLATFORM_REVISION, "1.0"}
+#define APPLE_DRIVEINFO_NETWORK   {"Dayna",    "SCSI/Link",         "2.0f",            ""}
+#define APPLE_DRIVEINFO_TAPE      {"FORGELNK", "APPLE_TAPE",        PLATFORM_REVISION, ""}
+
+#define AS400_DRIVEINFO_DGVS09U_FIXED  {"IBMAS400", "DGVS09U",      "02A1",             ""}
+#define AS400_DRIVEINFO_OPTICAL        {"IBM",      "CDRM00203",     PLATFORM_REVISION, ""}
+
+// Default Iomega ZIP drive information
+#define IOMEGA_DRIVEINFO_ZIP100     {"IOMEGA", "ZIP 100", "D.13", ""}
+#define IOMEGA_DRIVEINFO_ZIP250     {"IOMEGA", "ZIP 250", "42.S", ""}
+#define IOMEGA_DRIVEINFO_JAZ        {"iomega", "jaz", "", ""}
+
+// Default delay for SCSI phases.
+// Can be adjusted in ini file
+#define DEFAULT_SCSI_DELAY_US 10
+#define DEFAULT_REQ_TYPE_SETUP_NS 500
+
+// Use prefetch buffer in read requests
+#ifndef PREFETCH_BUFFER_SIZE
+#define PREFETCH_BUFFER_SIZE 8192
+#endif
+
+// Enable Copy-on-Write functionality for kiosk environments unless specifically disabled
+#ifndef ENABLE_COW
+#define ENABLE_COW 1
+#endif
+
+// Zip disk  media sizes
+#define ZIP100_DISK_SIZE    100663296 // bytes
+#define ZIP250_DISK_SIZE    250640384 // bytes
+
+#define TAPE_DEFAULT_NAME  "tape.000"
+
+// Settings for rebooting
+#define REBOOT_PURPOSE_MASK 0x00FFFFFF
+#define REBOOT_INTO_MASS_STORAGE_MAGIC_NUM 0x5eeded
+#define REBOOT_INTO_MASS_STORAGE_IMAGES_MAGIC_NUM 0x3e1ce5
+#define REBOOT_ENABLE_COW_BIT 0x01000000
+#define REBOOT_COW_BUTTON_STATE_MASK 0xFF
