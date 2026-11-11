@@ -1,0 +1,322 @@
+/** 
+ * ZuluSCSI™ - Copyright (c) 2022-2025 Rabbit Hole Computing™
+ * 
+ * ZuluSCSI™ firmware is licensed under the GPL version 3 or any later version. 
+ * 
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ * ----
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version. 
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details. 
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+**/
+
+// Accelerated SCSI subroutines for SCSI initiator/host side communication
+
+#include "scsi_accel_host.h"
+#include "ZuluSCSI_platform.h"
+#include "ZuluSCSI_log.h"
+#include <hardware/pio.h>
+#include <hardware/dma.h>
+#include <hardware/irq.h>
+#include <hardware/structs/iobank0.h>
+#include <hardware/sync.h>
+
+#ifdef PLATFORM_HAS_INITIATOR_MODE
+# include "scsi_accel_host_RP2MCU.pio.h"
+
+#define SCSI_PIO pio0
+#define SCSI_SM 0
+
+static struct {
+    // PIO configurations
+    uint32_t pio_offset_async_read;
+    pio_sm_config pio_cfg_async_read;
+} g_scsi_host;
+
+enum scsidma_state_t { SCSIHOST_IDLE = 0,
+                       SCSIHOST_READ };
+static volatile scsidma_state_t g_scsi_host_state;
+
+static void scsidma_set_data_gpio_func(uint32_t func, bool invert_data, bool wide)
+{
+    uint32_t invert = 0;
+
+    // Invert input and output data in hardware to speed things up.
+    if (invert_data) invert |= (1 << 16) | (1 << 12);
+
+    for (int i = SCSI_IO_DB0; i <= SCSI_IO_DB7; i++)
+    {
+        iobank0_hw->io[i].ctrl  = func | invert;
+    }
+    iobank0_hw->io[SCSI_IO_DBP].ctrl  = func;
+
+#ifdef ZULUSCSI_WIDE
+    // In 8-bit mode we don't drive the upper bits
+    if (wide)
+    {
+        for (int i = SCSI_IO_DB8; i <= SCSI_IO_DB15; i++)
+        {
+            iobank0_hw->io[i].ctrl  = func | invert;
+        }
+        iobank0_hw->io[SCSI_IO_DBP1].ctrl = func;
+    }
+    else
+    {
+        for (int i = SCSI_IO_DB8; i <= SCSI_IO_DB15; i++)
+        {
+            iobank0_hw->io[i].ctrl  = GPIO_FUNC_SIO | invert;
+        }
+        iobank0_hw->io[SCSI_IO_DBP1].ctrl = GPIO_FUNC_SIO;
+    }
+    #endif
+}
+
+static void scsi_accel_host_config_gpio(bool wide = false)
+{
+#ifdef ZULUSCSI_WIDE
+    bool invert_data = true;
+#else
+    bool invert_data = false;
+#endif
+    if (g_scsi_host_state == SCSIHOST_IDLE)
+    {
+        scsidma_set_data_gpio_func(GPIO_FUNC_SIO, invert_data, wide);
+        iobank0_hw->io[SCSI_IN_REQ].ctrl  = GPIO_FUNC_SIO;
+        iobank0_hw->io[SCSI_OUT_ACK].ctrl = GPIO_FUNC_SIO;
+    }
+    else if (g_scsi_host_state == SCSIHOST_READ)
+    {
+        // Data bus and REQ as input, ACK pin as output
+        pio_sm_set_pins(SCSI_PIO, SCSI_SM, SCSI_IO_DATA_MASK | 1 << SCSI_IN_REQ | 1 << SCSI_OUT_ACK);
+        if (wide)
+        {
+            pio_sm_set_consecutive_pindirs(SCSI_PIO, SCSI_SM, SCSI_IO_DB0, 18, false);
+        }
+        else
+        {
+            pio_sm_set_consecutive_pindirs(SCSI_PIO, SCSI_SM, SCSI_IO_DB0, 9, false);
+        }
+
+        pio_sm_set_consecutive_pindirs(SCSI_PIO, SCSI_SM, SCSI_IN_REQ, 1, false);
+        pio_sm_set_consecutive_pindirs(SCSI_PIO, SCSI_SM, SCSI_OUT_ACK, 1, true);
+
+        scsidma_set_data_gpio_func(GPIO_FUNC_SIO, invert_data, wide);
+        iobank0_hw->io[SCSI_IN_REQ].ctrl  = GPIO_FUNC_SIO;
+        iobank0_hw->io[SCSI_OUT_ACK].ctrl = GPIO_FUNC_PIO0;
+    }
+}
+
+uint32_t scsi_accel_host_read(uint8_t *buf, uint32_t count, int *parityError, int busWidth, volatile int *resetFlag)
+{
+    // Currently this method just reads from the PIO RX fifo directly in software loop.
+    // The SD card access is parallelized using DMA, so there is limited benefit from using DMA here.
+    g_scsi_host_state = SCSIHOST_READ;
+
+    int cd_start = SCSI_IN(CD);
+    int msg_start = SCSI_IN(MSG);
+
+    pio_sm_init(SCSI_PIO, SCSI_SM, g_scsi_host.pio_offset_async_read, &g_scsi_host.pio_cfg_async_read);
+    scsi_accel_host_config_gpio(busWidth);
+    pio_sm_set_enabled(SCSI_PIO, SCSI_SM, true);
+
+    // Set the number of bytes to read, must be divisible by 2.
+    assert((count & 1) == 0);
+    if (busWidth == 0)
+    {
+        // 8-bit bus
+        pio_sm_put(SCSI_PIO, SCSI_SM, count - 1);
+    }
+    else
+    {
+        // 16-bit bus
+        pio_sm_put(SCSI_PIO, SCSI_SM, count / 2 - 1);
+    }
+
+    // Read results from PIO RX FIFO
+    uint8_t *dst = buf;
+    uint8_t *end = buf + count;
+    uint32_t paritycheck = 0xFFFFFFFF;
+    uint32_t prev_rx_time = millis();
+    bool drain_then_stop = false;
+    while (dst < end)
+    {
+        uint32_t available = pio_sm_get_rx_fifo_level(SCSI_PIO, SCSI_SM);
+
+        if (available == 0)
+        {
+            // No new data has been received by PIO, check if there is a need to abort
+
+            bool abort = false;
+            if (*resetFlag)
+            {
+                dbgmsg("scsi_accel_host_read: Aborting due to reset request");
+                abort = true;
+            }
+            else if ((millis() - prev_rx_time) > 10000)
+            {
+                dbgmsg("scsi_accel_host_read: Aborting due to timeout");
+                abort = true;
+            }
+            else
+            {
+                // Some drives such as ST-296N may have glitches on phase signals in between
+                // byte transfers. This is allowed by SCSI spec, and officially we should only
+                // check the phase signals when REQ is active. However the PIO logic currently
+                // does not do this. Instead, when we detect a phase change, wait for 10 milliseconds
+                // to see if it is real.
+                int debounce = 100;
+                while (debounce > 0 && (!SCSI_IN(IO) || SCSI_IN(CD) != cd_start || SCSI_IN(MSG) != msg_start))
+                {
+                    debounce--;
+                    delayMicroseconds(100);
+                }
+
+                if (debounce == 0)
+                {
+                    dbgmsg("scsi_accel_host_read: aborting because target switched transfer phase (IO: ",
+                        (int)SCSI_IN(IO), ", CD: ", (int)SCSI_IN(CD), ", MSG: ", (int)SCSI_IN(MSG), ")");
+                    abort = true;
+                }
+            }
+
+            if (abort)
+            {
+                // Forge Link: the target can hand over its LAST word in the gap between
+                // the FIFO-level sample above and the phase check, then switch to STATUS. That word is already
+                // ACKed on the bus, so leaving it in the FIFO lost exactly 2 tail bytes (~1% of 32-byte reads on
+                // the S3000XL, status 00). Drain what the PIO holds before giving up, but ONLY when the target is
+                // waiting in STATUS (IO 1, CD 1, MSG 0): that proves the PIO took every byte it was owed. In any other
+                // phase the PIO (which never checks the phase) may have ACKed the status/message bytes as data, and
+                // the short count below is the honest answer (verify-lead review of 62d71d64). A reset request never
+                // drains. The drain is capped at the buffer's remaining space (an outside review), though the PIO's own
+                // byte counter already limits it to `count`.
+                bool in_status = SCSI_IN(IO) && SCSI_IN(CD) && !SCSI_IN(MSG);
+                available = (*resetFlag || !in_status) ? 0 : pio_sm_get_rx_fifo_level(SCSI_PIO, SCSI_SM);
+#ifdef ZULUSCSI_WIDE
+                uint32_t room = (busWidth == 0) ? (uint32_t)(end - dst) : (uint32_t)(end - dst) / 2;
+#else
+                uint32_t room = (uint32_t)(end - dst) / 2;
+#endif
+                if (available > room) available = room;
+                if (available == 0)
+                {
+                    count = dst - buf;
+                    break;
+                }
+                dbgmsg("scsi_accel_host_read: drained ", (int)available, " FIFO word(s) left at the STATUS switch");
+                drain_then_stop = true;
+            }
+        }
+
+        if (busWidth == 0)
+        {
+            // 8-bit bus
+            // For normal ZuluSCSI, there are two bytes per PIO word.
+            // For wide ZuluSCSI, there is one byte per PIO word.
+
+            while (available > 0)
+            {
+                available--;
+                uint32_t word = pio_sm_get(SCSI_PIO, SCSI_SM);
+                paritycheck ^= word;
+#ifdef ZULUSCSI_WIDE
+                *dst++ = word & 0xFF;
+#else
+                word = ~word;
+                *dst++ = word & 0xFF;
+                *dst++ = word >> 16;
+#endif
+            }
+        }
+        else
+        {
+            // 16-bit bus
+            while (available > 0)
+            {
+                available--;
+                uint32_t word = pio_sm_get(SCSI_PIO, SCSI_SM);
+                paritycheck ^= word;
+
+                *dst++ = word & 0xFF;
+                *dst++ = (word >> 8) & 0xFF;
+            }
+        }
+
+        if (drain_then_stop)
+        {
+            count = dst - buf;
+            break;
+        }
+    }
+
+    if (parityError)
+    {
+#ifdef ZULUSCSI_WIDE
+        bool parity_ok;
+        if (busWidth == 0)
+            parity_ok = scsi_check_parity(paritycheck);
+        else
+            parity_ok = scsi_check_parity_16bit(paritycheck);
+#else
+        bool parity_ok = scsi_check_parity(paritycheck & 0xFFFF) && scsi_check_parity(paritycheck >> 16);
+#endif
+
+        // Check parity errors in whole block
+        // This doesn't detect if there is even number of parity errors in block.
+        if (!parity_ok)
+        {
+            logmsg("Parity error in scsi_accel_host_read(): ", paritycheck);
+            *parityError = 1;
+        }
+    }
+    g_scsi_host_state = SCSIHOST_IDLE;
+    SCSI_RELEASE_DATA_REQ();
+    scsi_accel_host_config_gpio(busWidth);
+    pio_sm_set_enabled(SCSI_PIO, SCSI_SM, false);
+
+    return count;
+}
+
+
+void scsi_accel_host_init()
+{
+    g_scsi_host_state = SCSIHOST_IDLE;
+    scsi_accel_host_config_gpio();
+
+    // Load PIO programs
+    pio_clear_instruction_memory(SCSI_PIO);
+
+#ifdef ZULUSCSI_WIDE
+    // Asynchronous / synchronous SCSI read
+    const pio_program_t *program = &scsi_host_async_read_wide_program;
+#else
+    // Asynchronous / synchronous SCSI read
+    const pio_program_t *program = &scsi_host_async_read_program;
+#endif
+
+    g_scsi_host.pio_offset_async_read = pio_add_program(SCSI_PIO, program);
+
+    // Rewrite REQ pin based on IO assignment
+    //    wait 0 gpio REQ             side 1  ; Wait for REQ low
+    uint16_t instr = pio_encode_wait_gpio(false, SCSI_IN_REQ) | pio_encode_sideset(1, 1);
+    SCSI_PIO->instr_mem[g_scsi_host.pio_offset_async_read + 2] = instr;
+    instr =   pio_encode_wait_gpio(true, SCSI_IN_REQ) | pio_encode_sideset(1, 0);
+    SCSI_PIO->instr_mem[g_scsi_host.pio_offset_async_read + 5] = instr;
+
+    g_scsi_host.pio_cfg_async_read = scsi_host_async_read_program_get_default_config(g_scsi_host.pio_offset_async_read);
+    sm_config_set_in_pins(&g_scsi_host.pio_cfg_async_read, SCSI_IO_DB0);
+    sm_config_set_sideset_pins(&g_scsi_host.pio_cfg_async_read, SCSI_OUT_ACK);
+    sm_config_set_out_shift(&g_scsi_host.pio_cfg_async_read, true, false, 32);
+    sm_config_set_in_shift(&g_scsi_host.pio_cfg_async_read, true, true, 32);
+}
+
+#endif // PLATFORM_HAS_INITIATOR_MODE

@@ -1,0 +1,124 @@
+/** 
+ * ZuluSCSI™ - Copyright (c) 2024-2025 Rabbit Hole Computing™
+ * 
+ * ZuluSCSI™ firmware is licensed under the GPL version 3 or any later version. 
+ * 
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ * ----
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version. 
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details. 
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+**/
+#pragma once
+
+#ifdef ZULUSCSI_PICO
+# ifdef ZULUSCSI_DAYNAPORT
+#   define PLATFORM_NAME "Forge Link Pico DaynaPORT"
+# else
+#   define PLATFORM_NAME "Forge Link Pico"
+# endif
+# define PLATFORM_PID "Pico"
+# define PLATFORM_REVISION "2.0"
+# define PLATFORM_HAS_INITIATOR_MODE 1
+# define DISABLE_SWO
+# define PLATFORM_MAX_SCSI_SPEED S2S_CFG_SPEED_SYNC_20
+# define PLATFORM_DEFAULT_SCSI_SPEED_SETTING 20
+#elif defined(ZULUSCSI_PICO_2)
+# ifdef ZULUSCSI_PICO_2_DAYNAPORT
+#   define PLATFORM_NAME "Forge Link Pico 2 DaynaPORT"
+#   define PLATFORM_DEFAULT_SCSI_SPEED_SETTING 10
+# else
+#   define PLATFORM_NAME "Forge Link Pico 2"
+#   define PLATFORM_DEFAULT_SCSI_SPEED_SETTING 20
+# endif
+# define PLATFORM_PID "Pico 2"
+# define PLATFORM_REVISION "2.3A"
+# define PLATFORM_HAS_INITIATOR_MODE 1
+# define DISABLE_SWO
+# define PLATFORM_MAX_SCSI_SPEED S2S_CFG_SPEED_SYNC_20
+
+
+#elif defined(ZULUSCSI_BLASTER)
+# define PLATFORM_NAME "Forge Link"   // SHIP-1 (2026-10-12): the product name, never the trademark
+# define PLATFORM_PID "Blaster"
+# define PLATFORM_REVISION "2.3B"
+# define PLATFORM_HAS_INITIATOR_MODE 1
+# define PLATFORM_MAX_SCSI_SPEED S2S_CFG_SPEED_SYNC_20
+# define PLATFORM_DEFAULT_SCSI_SPEED_SETTING 20
+#elif defined(ZULUSCSI_WIDE)
+# define PLATFORM_NAME "Forge Link Wide"
+# define PLATFORM_PID "Wide"
+# define PLATFORM_REVISION "2.3W"
+# define PLATFORM_HAS_INITIATOR_MODE 1
+# define PLATFORM_MAX_SCSI_SPEED S2S_CFG_SPEED_SYNC_20
+# define PLATFORM_DEFAULT_SCSI_SPEED_SETTING 20
+# define PLATFORM_MAX_BUS_WIDTH 1
+# define PLATFORM_AUTH_CHECK_ENABLE
+# define PLATFORM_AUTH_CHECK_RANDID_ADDR ((uint8_t*)0x40130008)
+# define PLATFORM_AUTH_CHECK_RANDID_SIZE 16
+# define PLATFORM_AUTH_CHECK_SIGNATURE_ADDR ((uint8_t*)0x40131D80)
+# define PLATFORM_AUTH_CHECK_PUBKEY { \
+    0xc8, 0xa1, 0x3b, 0xe6, 0xed, 0x66, 0xb0, 0x24, \
+    0x46, 0x8d, 0x47, 0x6c, 0x84, 0x7e, 0xc9, 0xc8, \
+    0x40, 0xac, 0x3e, 0xf2, 0x0a, 0x07, 0xd2, 0x9d, \
+    0x02, 0xcd, 0x99, 0xcf, 0x17, 0xb9, 0xb2, 0xef, \
+}
+#elif defined(ZULUSCSI_BS2)
+# define PLATFORM_NAME "Forge Link BS2"
+# define PLATFORM_PID "BS2"
+# define PLATFORM_REVISION "1.0"
+# define PLATFORM_MAX_SCSI_SPEED S2S_CFG_SPEED_SYNC_20
+# define PLATFORM_DEFAULT_SCSI_SPEED_SETTING 20
+#else
+# define PLATFORM_NAME "Forge Link RP2040"
+# define PLATFORM_PID "RP2040"
+# define PLATFORM_REVISION "2.0"
+# define PLATFORM_HAS_INITIATOR_MODE 1
+# define PLATFORM_MAX_SCSI_SPEED S2S_CFG_SPEED_SYNC_20
+# define PLATFORM_DEFAULT_SCSI_SPEED_SETTING 20
+#endif
+
+#define PLATFORM_OPTIMAL_MIN_SD_WRITE_SIZE 32768
+#define PLATFORM_OPTIMAL_MAX_SD_WRITE_SIZE 65536
+#define PLATFORM_OPTIMAL_LAST_SD_WRITE_SIZE 8192
+#define SD_USE_SDIO 1
+#define PLATFORM_HAS_PARITY_CHECK 1
+
+#ifndef PLATFORM_VDD_WARNING_LIMIT_mV
+#define PLATFORM_VDD_WARNING_LIMIT_mV 2800
+#endif
+
+#ifndef PLATFORM_VDD_WARNING_DELAY_ms
+#define PLATFORM_VDD_WARNING_DELAY_ms 1000
+#endif
+
+#ifndef PLATFORM_MAX_BUS_WIDTH
+#define PLATFORM_MAX_BUS_WIDTH 0
+#endif
+
+#define PLATFORM_LED_PWM_WRAP 0xFFF
+// Divisors of max brightness
+#define PLATFORM_LED_PWM_INITIATOR_DIV 16
+#define PLATFORM_LED_PWM_BREATH_DIV   128
+#define PLATFORM_LED_PWM_BREATH_PERIOD_MS 400
+
+#ifndef PLATFORM_AS400
+#define  PLATFORM_AS400
+#endif
+
+#ifndef STANDARD_I2C_CLK_SPEED
+#define STANDARD_I2C_CLK_SPEED 100000
+#endif
+
+#ifndef FAST_I2C_CLK_SPEED
+#define FAST_I2C_CLK_SPEED 400000
+#endif
