@@ -1,0 +1,282 @@
+/** 
+ * SCSI2SD V6 - Copyright (C) 2013 Michael McMaster <michael@codesrc.com>
+ * Copyright (C) 2014 Doug Brown <doug@downtowndougbrown.com
+ * ZuluSCSI™ - Copyright (c) 2022-2026 Rabbit Hole Computing™
+ * Copyright (c) 2023 joshua stein <jcs@jcs.org>
+ * 
+ * It is derived from disk.h in SCSI2SD V6.
+ * 
+ * This file is licensed under the GPL version 3 or any later version. 
+ * 
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ * ----
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version. 
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details. 
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+**/
+
+// SCSI disk access routines
+// Implements both SCSI2SD V6 disk.h functions and some extra.
+
+#pragma once
+
+#include <stdint.h>
+#include <scsi2sd.h>
+#include <scsiPhy.h>
+#include "ImageBackingStore.h"
+#include "ZuluSCSI_config.h"
+#include <CUEParser.h>
+
+extern "C" {
+#include <disk.h>
+#include <config.h>
+#include <scsi.h>
+}
+
+// Optimal size for read block from SCSI bus
+// For platforms with nonblocking transfer, this can be large.
+// For Akai MPC60 compatibility this has to be at least 5120
+#ifndef PLATFORM_OPTIMAL_SCSI_READ_BLOCK_SIZE
+#ifdef PLATFORM_SCSIPHY_HAS_NONBLOCKING_READ
+#define PLATFORM_OPTIMAL_SCSI_READ_BLOCK_SIZE 65536
+#else
+#define PLATFORM_OPTIMAL_SCSI_READ_BLOCK_SIZE 8192
+#endif
+#endif
+
+// Extended configuration stored alongside the normal SCSI2SD target information
+struct image_config_t: public S2S_TargetCfg
+{
+    image_config_t() {};
+
+    ImageBackingStore file;
+
+    // For CD-ROM drive ejection
+    bool ejected;
+    uint8_t cdrom_events;
+    bool reinsert_on_inquiry; // Reinsert on Inquiry command (to reinsert automatically after boot)
+    bool reinsert_after_eject; // Reinsert next image after ejection
+    bool eject_on_stop; // Eject image on START STOP UNIT with start = 0
+
+    // selects a physical button channel that will cause an eject action
+    // default option of '0' disables this functionality
+    uint8_t ejectButton;
+
+    // Eject function for fixed disks
+    bool ejectFixedDiskEnable;
+    bool ejectFixedDiskReadOnly;
+    uint32_t ejectFixedDiskDelay;
+    bool ejectFixedDiskPending;
+    uint32_t ejectFixedDiskTimer;
+    bool ejectFixedDiskWriteBlocked;
+
+    // True if there is a subdirectory of images for this target
+    bool image_directory;
+
+    // True if the device type was determined by the drive prefix
+    bool use_prefix;
+
+    // the name of the currently mounted image in a dynamic image directory
+    char current_image[MAX_FILE_PATH];
+
+    // Index of image, for when image on-the-fly switching is used for CD drives
+    // This is also used for dynamic directories to track how many images have been seen
+    // Negative value forces restart from first image.
+    int image_index;
+
+    // Previously accessed CD-ROM track, cached for performance
+    CUETrackInfo cdrom_trackinfo;
+    uint32_t cdrom_track_end_lba;
+
+    // Loaded .bin file index for .cue/.bin with multiple files
+    // Matches trackinfo.file_index
+    int cdrom_binfile_index;
+
+    // Cue sheet file for CD-ROM images
+    FsFile cuesheetfile;
+
+    // the bin file for the cue sheet, the directory for multi bin files, or closed if neither
+    FsFile bin_container;
+
+
+    inline bool is_multi_bin_cue() {return bin_container.isOpen() && bin_container.isDir();}
+
+    // Right-align vendor / product type strings
+    // Standard SCSI uses left alignment
+    int rightAlignStrings;
+
+    // Set Vendor / Product Id from image file name
+    bool name_from_image;
+
+    // Maximum amount of bytes to prefetch
+    int prefetchbytes;
+
+    // Warning about geometry settings
+    bool geometrywarningprinted;
+
+    // Set the device type
+    void setDeviceType(S2S_CFG_TYPE device_type);
+
+    // Clear any image state to zeros
+    void clear();
+
+    uint32_t get_capacity_lba();
+
+private:
+    // There should be only one global instance of this struct per device, so make copy constructor private.
+    image_config_t(const image_config_t&) = default;
+};
+
+// Should be polled intermittently to update the platform eject buttons.
+// Call with 'true' only if ejections should be performed immediately (typically when not busy)
+// Returns a mask of the buttons that registered an 'eject' action.
+uint8_t diskEjectButtonUpdate(bool immediate);
+
+// Check if pending disk ejects are due to be executed
+void diskEjectDelayCheck(void);
+
+// Reset all image configuration to empty reset state, close all images.
+void scsiDiskResetImages();
+
+// Close any files opened from SD card (prepare for remounting SD)
+void scsiDiskCloseSDCardImages();
+
+// Get blocksize from filename or use device setting in ini file
+uint32_t getBlockSize(const char *filename, uint8_t scsi_id);
+
+// AS/400 Related
+int16_t skip_next(int max);
+
+// Get and set the eject button bit flags
+uint8_t getEjectButton(uint8_t idx);
+void    setEjectButton(uint8_t idx, int8_t eject_button);
+
+// Perform eject for devices
+void doPerformEject(image_config_t &img);
+
+void scsiDiskCloseTray(image_config_t &img);
+
+bool scsiDiskOpenHDDImage(int target_idx, const char *filename, int scsi_lun, int blocksize, S2S_CFG_TYPE type = S2S_CFG_FIXED, bool use_prefix = false);
+void scsiDiskLoadConfig(int target_idx);
+
+// Read IMG0-IMG99 entry from an ini section, accepting both
+// unpadded (IMG5) and zero-padded (IMG05) single digit keys.
+int scsiDiskReadImgX(const char *section, int index, char *buf, size_t buflen);
+
+// Checks if a filename extension is appropriate for further processing as a disk image.
+// The current implementation does not check the the filename prefix for validity.
+bool scsiDiskFilenameValid(const char* name, bool quiet = false);
+
+// Check if a directory contains a .cue sheet file.
+// This is used when single .cue sheet references multiple .bin files.
+bool scsiDiskFolderContainsCueSheet(FsFile *dir);
+
+// Checks if the directory name is for multi tagged tapes
+bool scsiDiskFolderIsTapeFolder(FsFile *dir);
+
+// Clear the ROM drive header from flash
+bool scsiDiskClearRomDrive();
+// Program ROM drive and rename image file
+bool scsiDiskProgramRomDrive(const char *filename, int scsi_id, int blocksize, S2S_CFG_TYPE type);
+
+// Check if there is ROM drive configured in microcontroller flash
+bool scsiDiskCheckRomDrive();
+bool scsiDiskActivateRomDrive();
+
+// Returns true if there is at least one image active
+bool scsiDiskCheckAnyImagesConfigured();
+
+// Finds filename with the lowest lexical order _after_ the given filename in
+// the given folder. If there is no file after the given one, or if there is
+// no current file, this will return the lowest filename encountered.
+int findNextImageAfter(image_config_t &img, const char* dirname, const char* filename, char* buf, size_t buflen, bool ignore_prefix = false);
+
+// Gets the next image filename for the target, if configured for multiple
+// images. As a side effect this advances image tracking to the next image.
+// Returns the length of the new image filename, or 0 if the target is not
+// configured for multiple images.
+int scsiDiskGetNextImageName(image_config_t &img, char *buf, size_t buflen);
+
+// Get pointer to extended image configuration based on target idx
+image_config_t &scsiDiskGetImageConfig(int target_idx);
+
+// Start data transfer from disk image to SCSI bus
+// Can be called by device type specific command implementations (such as READ CD)
+void scsiDiskStartRead(uint32_t lba, uint32_t blocks);
+
+// Start data transfer from SCSI bus to disk image
+void scsiDiskStartWrite(uint32_t lba, uint32_t blocks);
+
+// Returns true if there is at least one network device active
+bool scsiDiskCheckAnyNetworkDevicesConfigured();
+
+
+// Switch to next Drive image if multiple have been configured
+bool switchNextImage(image_config_t &img, const char* next_filename = nullptr);
+
+// Parse SCSI ID - if illegal return -1 else return the SCSI Id
+int8_t scsiParseId(const char scsi_id_text);
+
+// Encode ID as char
+char scsiEncodeID(const uint8_t scsi_id);
+
+// Size of a buffer that can hold any device section name, e.g. "SCSI15"
+#define SCSI_INI_SECTION_SIZE 7
+
+// Write the CONFIGFILE section name for the given SCSI ID into buffer and return it.
+// IDs 10 to 15 can be written either as [SCSI10] - [SCSI15] or as [SCSIA] - [SCSIF],
+// the decimal form takes precedence when both are present in the file.
+const char *scsiGetIniSection(const uint8_t scsi_id, char *buffer, size_t buffer_size);
+
+// Forget which duplicate device sections have already been reported so that they
+// are logged again after the config file has been re-read.
+void scsiResetIniSectionWarnings();
+
+// Store the SCSI ID read at boot (-1 = not available).
+// Must be called before readSCSIDeviceConfig().
+void scsiDiskSetDynamicId(int8_t id);
+
+// Return the stored dynamic SCSI ID (-1 if not set).
+int8_t scsiDiskGetDynamicId();
+
+// Return true if any 'n'-prefixed device directory (HDn, CDn, TPn, …) exists on the SD card.
+// Used to decide whether to query the SCA hardware for a dynamic SCSI ID before
+// readSCSIDeviceConfig() runs.
+bool scsiDiskHasDynamicDirs();
+
+// Return true if the [SCSIn] section in the config file names an image on its
+// own (Partition / IMG0 / IMG00 / ImgDir), i.e. the dynamic target is
+// configured purely from the .ini with no 'n'-named file or directory to
+// trigger the lazy ID lookup.
+bool scsiDiskHasDynamicIniImage();
+
+// Begin writing to prefetch buffer.
+// If the buffer is not available, returns NULL.
+// Otherwise returns pointer to which caller can write up to maxSectors sectors.
+uint8_t *scsiDiskPrefetchBeginWrite(uint8_t scsiId, uint32_t firstSector, uint32_t bytesPerSector, uint32_t *maxSectors);
+
+// Mark prefetch sectors in buffer as valid.
+// Should be called after scsiDiskPrefetchBeginWrite().
+void scsiDiskPrefetchFinishWrite(uint8_t scsiId, uint32_t firstSector, uint32_t bytesPerSector, uint32_t numSectors);
+
+// Check if data is available from prefetch buffer.
+// If data is not found, returns NULL.
+// Otherwise returns pointer for reading up to numSectors sectors of data, beginning at firstSector.
+const uint8_t *scsiDiskPrefetchRead(uint8_t scsiId, uint32_t firstSector, uint32_t bytesPerSector, uint32_t *numSectors);
+
+// Invalidate SCSI prefetch buffer
+// Invalidate SCSI prefetch buffer.
+// If scsiId is given, only invalidate if that device has data in buffer.
+// If scsiId is not given (value -1), invalidate for all devices.
+void scsiDiskPrefetchInvalidate(uint8_t scsiId = (uint8_t)-1);
+
+bool scsiDiskTypeIsRemovable(S2S_CFG_TYPE type);

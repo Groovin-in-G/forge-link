@@ -1,0 +1,505 @@
+/* Based on GCC ARM embedded samples.
+   Defines the following symbols for use by code:
+    __exidx_start
+    __exidx_end
+    __etext
+    __data_start__
+    __preinit_array_start
+    __preinit_array_end
+    __init_array_start
+    __init_array_end
+    __fini_array_start
+    __fini_array_end
+    __data_end__
+    __bss_start__
+    __bss_end__
+    __end__
+    end
+    __HeapLimit
+    __StackLimit
+    __StackTop
+    __stack (== StackTop)
+*/
+
+MEMORY
+{
+    FLASH(rx) : ORIGIN = 0x10000000, LENGTH = $program_size
+    PSRAM(rwx) : ORIGIN = 0x11000000, LENGTH = 0
+    RAM(rwx) : ORIGIN = 0x20000000, LENGTH = 512k  /* Leave space for pico-debug */
+    SCRATCH_X(rwx) : ORIGIN = 0x20080000, LENGTH = 4k
+    SCRATCH_Y(rwx) : ORIGIN = 0x20081000, LENGTH = 4k
+}
+
+PROVIDE ( _EEPROM_start = __EEPROM_START__ );
+PROVIDE ( _FS_start     = __FS_START__ );
+PROVIDE ( _FS_end       = __FS_END__ );
+
+ENTRY(_entry_point)
+
+SECTIONS
+{
+    .flash_begin : {
+        __flash_binary_start = .;
+    } > FLASH
+
+    /* The bootrom will enter the image at the point indicated in your
+       IMAGE_DEF, which is usually the reset handler of your vector table.
+
+       The debugger will use the ELF entry point, which is the _entry_point
+       symbol, and in our case is *different from the bootrom's entry point.*
+       This is used to go back through the bootrom on debugger launches only,
+       to perform the same initial flash setup that would be performed on a
+       cold boot.
+    */
+
+    /* If ZuluSCSI SD card bootloader is included, it goes in first 128 kB */
+    .text.bootloader : ALIGN(16) SUBALIGN(16)
+    {
+        KEEP(*(.text.btldr*))
+        . = ALIGN(131072);
+        CHECK_BOOTLOADER_SIZE = 1 / (. <= 131072);
+    } > FLASH
+
+    .text : {
+        __logical_binary_start = .;
+        KEEP (*(.vectors))
+        KEEP (*(.binary_info_header))
+        __binary_info_header_end = .;
+        KEEP (*(.embedded_block))
+        __embedded_block_end = .;
+        KEEP (*(.reset))
+        /* TODO revisit this now memset/memcpy/float in ROM */
+        /* bit of a hack right now to exclude all floating point and time critical (e.g. memset, memcpy) code from
+         * FLASH ... we will include any thing excluded here in .data below by default */
+        *(.init)
+        *libgcc.a:cmse_nonsecure_call.o
+
+        *minIni.a*:(.text .text*)
+        *libZipParser.a*:(.text .text*)
+        *libZuluSCSI_audio_RP2MCU.a*:(.text .text*)
+        *libZuluSCSI_Control.a*:(.text .text*)
+        *libZuluSCSI_UI_RP2MCU.a*:(.text .text*)
+        *libZuluSCSI_WebUI_RP2MCU.a*:(.text .text*)
+        *libAdafruit*:(.text .text*)
+        *libRP2350_Logic_Sniffer.a*:(.text .text*)
+        *libCUEParser.a*:(.text .text*)
+
+/* =============================================================== */
+    /* Exclude as much code from flash as possible as the RP2350 series has twice as much SRAM */
+        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *libZuluSCSI_platform_RP2MCU.a: *libSdFat.a: *libZuluContainerFS.a: *libSCSI2SD.a: *.cpp.o)  .text*)
+
+    /* ---------------------------------------------------------
+    Uncomment the EXCLUDE_FILE line below and comment the EXCLUDE_FILE line above for debug to work properly,
+    the initial break point to main seems to get clobbered when everything is in SRAM.
+    You may have to delete the "firmware.elf" file so the next build links with newly modified linker script
+
+    Alternatively, use "hbreak" in gdb to force hardware
+    breakpoints instead of RAM breakpoints.
+    ------------------------------------------------------------*/
+        /* *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .text*) */
+/* =============================================================== */
+
+        /* Manually pull in some of the larger functions into flash to leave more RAM free */
+
+
+        /* Standard library floating point etc. functions */
+        *libm*:(.text .text*)
+        /* Forge Link C5: ANCHORED to the toolchain archive. Upstream's `*libc*:` also matched any
+           PlatformIO library build folder named lib<3 hex of sha1(path)> starting with c
+           (libc12/ etc), sending that library - once the SCSI IRQ handlers - to flash.
+           Guard: tools/tests/test_ld_globs.py. */
+        *libc.a:(.text .text*)
+        *libgcc*:*df*(.text .text*)
+        *USB*(.text .text*)
+        *SPI*(.text .text*)
+        *Spi*(.text .text*)
+        *spi*(.text .text*)
+        *stdc*:(.text .text*)
+        *supc*:(.text .text*)
+        *nosys*:(.text .text*)
+        *libc.a:*printf*(.text .text*)
+        *libc.a:*toa*(.text .text*)
+
+        /* C++ constructors and destructors */
+        *(.text*_ZN*C1*)
+        *(.text*_ZN*C2*)
+        *(.text*_ZN*D1*)
+        *(.text*_ZN*D2*)
+
+        /* Initialization functions go to flash */
+        *(.text*platform_init*)
+        *(.text*platform_late_init*)
+        *(.text*platform_enter_msc*)
+        *(.text*zuluscsi_setup*)
+        *(.text*audio_setup*)
+        *(.text*init_logfile*)
+        *(.text*find_chs_capacity*)
+        *(.text*irq_remove_handler*)
+        *(.text*irq_add_shared_handler*)
+        *(.text*image_config_t*clear*)
+        *(.text*reinitSCSI*)
+        *(.text*print_sd_info*)
+        *(.text*kiosk_restore_images*)
+        *(.text*scsi_accel_rp2040_init*)
+        *(.text*rp2040_sdio_init*)
+        *(.text*PIOProgram*prepare*)
+        *(.text*createImage*)
+        *(.text*s2s_configInit*)
+        *(.text*SdioCard*begin*)
+        *(.text*mountSDCard*)
+        *(.text*set_timings_from_file*)
+        *(.text*scsiInit*)
+
+        /* ROM drive setup and FW upgrade that is done only during init */
+        *(.text*romDriveClear*)
+        *(.text*romDriveCheckPresent*)
+        *(.text*zipparser*)
+        *(.text*firmware_update*)
+        *(.text*verify_extracted_firmware*)
+        *(.text*crc32_update*)
+
+        /* ZuluSCSI_disk functions that are only used during init */
+        *ZuluSCSI_settings.cpp.o(.text .text*)
+        *QuirksCheck.cpp.o(.text .text*)
+        *(.text*scsiDiskFilenameValid*)
+        *(.text*scsiDiskOpenHDDImage*)
+        *(.text*scsiDiskGetNextImageName*)
+        *(.text*scsiDiskProgramRomDrive*)
+        *(.text*scsiDiskLoadConfig*)
+        *(.text*scsiDiskActivateRomDrive*)
+        *(.text*scsiDiskSetImageConfig*)
+        *(.text*ImageBackingStore*open*)
+        *(.text*ImageBackingStore*ImageBackingStore*)
+        *(.text*findHDDImages*)
+        *(.text*scsiDiskCloseSDCardImages*)
+        *(.text*extractFileName*)
+        *(.text*setNameFromImage*)
+        *(.text*getBlockSize*)
+
+        /* Wi-Fi association, only used during init and reconnect. Keeps the
+         * packet path (platform_network_send/receive) in RAM. */
+        *(.text*platform_network_wifi_join*)
+        *(.text*wifi_security_name*)
+        *(.text*wifi_security_auth*)
+
+        /* SCSI commands that don't require high performance */
+        *(.text*scsiToolboxCommand*)
+        *(.text*scsi*Diagnostic*)
+        *(.text*Inquiry*)
+        *(.text*modeSelect*)
+        *(.text*modeSense*)
+        *(.text*doModeSelect*)
+        *(.text*doModeSense*)
+        *(.text*scsiModeCommand*)
+        *(.text*doPerformEject*)
+
+        /* CDROM/Tape/Vendor commands. Most of these are non-performance-critical, and
+         * the important parts will fit in cache when in use. */
+        *(.text*scsiTapeCommand*)
+        *(.text*scsiCDRomCommand*)
+        *(.text*scsiMOCommand*)
+        *(.text*doReadCD*)
+        *(.text*doReadTOC*)
+        *(.text*doReadHeader*)
+        *(.text*doPlayAudio*)
+        *(.text*audio_play*)
+        *(.text*doReadSubchannel*)
+        *(.text*doGetConfiguration*)
+        *(.text*cdromPerformEject*)
+        *(.text*CueSheet*)
+        *(.text*switchNextImage*)
+        *(.text*findNextImageAfter*)
+        *(.text*DiscInfo*)
+        *(.text*TrackInfo*)
+        *(.text*doCountFiles*)
+        *(.text*doReadFullTOC*)
+        *(.text*scsiVendorCommand*)
+        *(.text*onListFiles*)
+
+        /* SCSI Initiator mode code. These will fit in cache when in use. */
+        *ZuluSCSI_initiator.cpp.o(.text .text*)
+        *ZuluSCSI_msc_initiator.cpp.o(.text .text*)
+        *scsi_accel_host*(.text .text*)
+        *scsiHostPhy*(.text .text*)
+
+        /* Filesystem functions that are not performance-critical.
+         * Mostly used during initialization only. */
+        *(.text*File*open*)
+        *(.text*File*init*)
+        *(.text*File*remove*)
+        *(.text*File*truncate*)
+        *(.text*File*sync*)
+        *(.text*File*mkdir*)
+        *(.text*File*bitmap*)
+        *(.text*File*Name*)
+        *(.text*File*SFN*)
+        *(.text*File*LFN*)
+        *(.text*File*addCluster*)
+        *(.text*Volume*attrib*)
+        *(.text*Volume*begin*)
+
+        /* USB functions that only run in specific modes.
+           These will fit in cache when they are in use (USB connected). */
+        *libpico*:*(.text*msc*)
+        *libpico*:*(.text*hidd*)
+        *(.text*tud_msc*)
+
+
+        *(.fini)
+        /* Pull all c'tors into .text */
+        *crtbegin.o(.ctors)
+        *crtbegin?.o(.ctors)
+        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .ctors)
+        *(SORT(.ctors.*))
+        *(.ctors)
+        /* Followed by destructors */
+        *crtbegin.o(.dtors)
+        *crtbegin?.o(.dtors)
+        *(EXCLUDE_FILE(*crtend?.o *crtend.o) .dtors)
+        *(SORT(.dtors.*))
+        *(.dtors)
+
+        . = ALIGN(4);
+        /* preinit data */
+        PROVIDE_HIDDEN (__preinit_array_start = .);
+        KEEP(*(SORT(.preinit_array.*)))
+        KEEP(*(.preinit_array))
+        PROVIDE_HIDDEN (__preinit_array_end = .);
+
+        . = ALIGN(4);
+        /* init data */
+        PROVIDE_HIDDEN (__init_array_start = .);
+        KEEP(*(SORT(.init_array.*)))
+        KEEP(*(.init_array))
+        PROVIDE_HIDDEN (__init_array_end = .);
+
+        . = ALIGN(4);
+        /* finit data */
+        PROVIDE_HIDDEN (__fini_array_start = .);
+        *(SORT(.fini_array.*))
+        *(.fini_array)
+        PROVIDE_HIDDEN (__fini_array_end = .);
+
+        *(.eh_frame*)
+        . = ALIGN(4);
+
+    } > FLASH
+
+    /* Note the boot2 section is optional, and should be discarded if there is
+       no reference to it *inside* the binary, as it is not called by the
+       bootrom. (The bootrom performs a simple best-effort XIP setup and
+       leaves it to the binary to do anything more sophisticated.) However
+       there is still a size limit of 256 bytes, to ensure the boot2 can be
+       stored in boot RAM.
+
+       Really this is a "XIP setup function" -- the name boot2 is historic and
+       refers to its dual-purpose on RP2040, where it also handled vectoring
+       from the bootrom into the user image.
+    */
+
+    .boot2 : {
+        __boot2_start__ = .;
+        *(.boot2)
+        __boot2_end__ = .;
+    } > FLASH
+
+    ASSERT(__boot2_end__ - __boot2_start__ <= 256,
+        "ERROR: Pico second stage bootloader must be no more than 256 bytes in size")
+
+    .rodata : {
+        /* Exclude as many constants as possible from flash as corresponding to the code that has been removed from flash
+            to keep the MCU from having to hit flash while it is executing in SRAM */
+        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:  *libZuluSCSI_platform_RP2MCU.a: *libZuluSCSI_UI_RP2MCU.a: *libSdFat.a: *libSCSI2SD.a: *CUEParser.a: *minIni.a: *.cpp.o) .rodata*)
+/* Uncomment below and comment above lines for debugging */
+        /* *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .rodata*) */
+
+        *(.srodata*)
+        . = ALIGN(4);
+        *(SORT_BY_ALIGNMENT(SORT_BY_NAME(.flashdata*)))
+        . = ALIGN(4);
+    } > FLASH
+
+    .ARM.extab :
+    {
+        *(.ARM.extab* .gnu.linkonce.armextab.*)
+    } > FLASH
+
+    __exidx_start = .;
+    .ARM.exidx :
+    {
+        *(.ARM.exidx* .gnu.linkonce.armexidx.*)
+    } > FLASH
+    __exidx_end = .;
+
+    /* Machine inspectable binary information */
+    . = ALIGN(4);
+    __binary_info_start = .;
+    .binary_info :
+    {
+        KEEP(*(.binary_info.keep.*))
+        *(.binary_info.*)
+    } > FLASH
+    __binary_info_end = .;
+    . = ALIGN(4);
+
+    .ram_vector_table (COPY): {
+        *(.ram_vector_table)
+    } > RAM
+
+    .uninitialized_data (COPY): {
+        . = ALIGN(4);
+        *(.uninitialized_data*)
+    } > RAM
+
+    .data : {
+        __data_start__ = .;
+        *(vtable)
+
+        *(.time_critical*)
+        . = ALIGN(4);
+        /* remaining .text and .rodata; i.e. stuff we exclude above because we want it in RAM */
+        *(.text)
+        *(.text*)
+        . = ALIGN(4);
+        *(.rodata*)
+        . = ALIGN(4);
+        *(.data*)
+        . = ALIGN(4);
+        *(.sdata*)
+        . = ALIGN(4);
+        *(.after_data.*)
+        . = ALIGN(4);
+        /* preinit data */
+        PROVIDE_HIDDEN (__mutex_array_start = .);
+        KEEP(*(SORT(.mutex_array.*)))
+        KEEP(*(.mutex_array))
+        PROVIDE_HIDDEN (__mutex_array_end = .);
+
+        *(.jcr)
+        . = ALIGN(4);
+    } > RAM AT> FLASH
+
+    .tdata : {
+        . = ALIGN(4);
+		*(.tdata .tdata.* .gnu.linkonce.td.*)
+        /* All data end */
+        __tdata_end = .;
+    } > RAM AT> FLASH
+    PROVIDE(__data_end__ = .);
+
+    /* __etext is (for backwards compatibility) the name of the .data init source pointer (...) */
+    __etext = LOADADDR(.data);
+
+    .tbss (NOLOAD) : {
+        . = ALIGN(4);
+        __bss_start__ = .;
+        __tls_base = .;
+        *(.tbss .tbss.* .gnu.linkonce.tb.*)
+        *(.tcommon)
+
+        __tls_end = .;
+    } > RAM
+
+    .bss (NOLOAD) : {
+        . = ALIGN(4);
+        __tbss_end = .;
+
+        *(SORT_BY_ALIGNMENT(SORT_BY_NAME(.bss*)))
+        *(COMMON)
+        /* Python template escaping dollar sign with two dollar signs */
+        PROVIDE(__global_pointer$$ = . + 2K);
+        *(.sbss*)
+        . = ALIGN(4);
+        __bss_end__ = .;
+    } > RAM
+
+    .heap (NOLOAD):
+    {
+        __end__ = .;
+        end = __end__;
+        KEEP(*(.heap*))
+        /* historically on GCC sbrk was growing past __HeapLimit to __StackLimit, however
+           to be more compatible, we now set __HeapLimit explicitly to where the end of the heap is */
+        . = ORIGIN(RAM) + LENGTH(RAM);
+        __HeapLimit = .;
+    } > RAM
+
+    /* Start and end symbols must be word-aligned */
+    .scratch_x : {
+        __scratch_x_start__ = .;
+        *(.scratch_x.*)
+        . = ALIGN(4);
+        __scratch_x_end__ = .;
+    } > SCRATCH_X AT > FLASH
+    __scratch_x_source__ = LOADADDR(.scratch_x);
+
+    .scratch_y : {
+        __scratch_y_start__ = .;
+        *(.scratch_y.*)
+        . = ALIGN(4);
+        __scratch_y_end__ = .;
+    } > SCRATCH_Y AT > FLASH
+    __scratch_y_source__ = LOADADDR(.scratch_y);
+
+    /* .stack*_dummy section doesn't contains any symbols. It is only
+     * used for linker to calculate size of stack sections, and assign
+     * values to stack symbols later
+     *
+     * stack1 section may be empty/missing if platform_launch_core1 is not used */
+
+    /* by default we put core 0 stack at the end of scratch Y, so that if core 1
+     * stack is not used then all of SCRATCH_X is free.
+     */
+    .stack1_dummy (NOLOAD):
+    {
+        *(.stack1*)
+    } > SCRATCH_X
+    .stack_dummy (NOLOAD):
+    {
+        KEEP(*(.stack*))
+    } > SCRATCH_Y
+
+    .flash_end : {
+        KEEP(*(.embedded_end_block*))
+        PROVIDE(__flash_binary_end = .);
+    } > FLASH =0xaa
+
+    .psram (NOLOAD) : {
+        __psram_start__ = .;
+        *(.psram*)
+        . = ALIGN(4096);
+        __psram_heap_start__ = .;
+    } > PSRAM
+
+    /* stack limit is poorly named, but historically is maximum heap ptr */
+    __StackLimit = ORIGIN(RAM) + LENGTH(RAM);
+    __StackOneTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
+    __StackTop = ORIGIN(SCRATCH_Y) + LENGTH(SCRATCH_Y);
+    __StackOneBottom = __scratch_x_end__;
+    __StackBottom = __scratch_y_end__;
+    PROVIDE(__stack = __StackTop);
+
+    /* picolibc and LLVM */
+    PROVIDE (__heap_start = __end__);
+    PROVIDE (__heap_end = __HeapLimit);
+    PROVIDE( __tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss)) );
+    PROVIDE( __tls_size_align = (__tls_size + __tls_align - 1) & ~(__tls_align - 1));
+    PROVIDE( __arm32_tls_tcb_offset = MAX(8, __tls_align) );
+
+    /* TLSF */
+    PROVIDE (__psram_start = __psram_start__);
+    PROVIDE (__psram_heap_start = __psram_heap_start__);
+
+    /* llvm-libc */
+    PROVIDE (_end = __end__);
+    PROVIDE (__llvm_libc_heap_limit = __HeapLimit);
+
+    /* Check if data + heap + stack exceeds RAM limit */
+    ASSERT(__StackLimit >= __HeapLimit, "region RAM overflowed")
+
+    ASSERT( __binary_info_header_end - __logical_binary_start <= 1024, "Binary info must be in first 1024 bytes of the binary")
+    ASSERT( __embedded_block_end - __logical_binary_start <= 4096, "Embedded block must be in first 4096 bytes of the binary")
+
+    /* todo assert on extra code */
+}
+

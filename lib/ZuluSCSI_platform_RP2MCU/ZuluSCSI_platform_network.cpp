@@ -1,0 +1,666 @@
+/*
+ * Copyright (c) 2023 joshua stein <jcs@jcs.org>
+ * Copyright (c) 2026 Eric Helgeson <eric@bluescsi.com>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+#ifdef ZULUSCSI_NETWORK
+#include <Arduino.h>
+#include "ZuluSCSI_platform_network.h"
+#include "ZuluSCSI_log.h"
+#include "ZuluSCSI_config.h"
+#include <scsi.h>
+#include <network.h>
+#include <ZuluSCSI_settings.h>
+
+extern "C" {
+
+#include <cyw43.h>
+#include <pico/cyw43_arch.h>
+#include <pico/unique_id.h>
+
+#ifndef CYW43_IOCTL_GET_RSSI
+#define CYW43_IOCTL_GET_RSSI (0xfe)
+#endif
+
+#define PICO_W_GPIO_LED_PIN 0
+#define PICO_W_LED_ON() cyw43_arch_gpio_put(PICO_W_GPIO_LED_PIN, 1)
+#define PICO_W_LED_OFF() cyw43_arch_gpio_put(PICO_W_GPIO_LED_PIN, 0)
+#define PICO_W_LONG_BLINK_DELAY 200
+#define PICO_W_SHORT_BLINK_DELAY 75
+#define PICO_W_BLINK_CONNECTED_TIMES 3
+enum blink_connected_t
+{
+	BLINK_CONNECTED_OFF = 0,
+	BLINK_CONNECTED_ON,
+	BLINK_CONNECTED_ACTIVE,
+};
+static blink_connected_t g_blink_connected = BLINK_CONNECTED_OFF;
+
+
+// A default DaynaPort-compatible MAC
+static const char defaultMAC[] = { 0x00, 0x80, 0x19, 0xc0, 0xff, 0xee };
+
+static bool network_in_use = false;
+static bool g_wifi_reconnect = true;
+static char g_wifi_reconnect_ssid[32 + 1] = {0};
+static char g_wifi_reconnect_password[63 + 1] = {0};
+
+// WiFi reconnection state (file-static so wifi_join can reset on credential change)
+static uint32_t wifi_reconnect_time = 0;
+static uint32_t wifi_reconnect_interval = WIFI_RECONNECT_START_INTERVAL;
+static int wifi_reconnect_attempts = 0;
+static bool g_wifi_scan_restore_connection = false;
+static bool g_wifi_scan_suspend_reconnect = false;
+
+// Whether the current association was made with a passphrase. The CYW43 driver
+// has no getter for the auth mode of a live association, so remember what was
+// asked for at join time.
+static bool g_wifi_join_secured = false;
+
+// How long to wait for an association to finish before reporting it stalled.
+#define WIFI_JOIN_STALL_TIMEOUT 30000
+
+// Start of the most recent join attempt, or 0 once the link is up.
+static uint32_t wifi_join_time = 0;
+static bool wifi_join_stall_reported = false;
+
+static const char *wifi_security_name(uint8_t security)
+{
+	switch (security)
+	{
+		case WIFI_SECURITY_WPA2_AES:  return "WPA2 AES PSK";
+		case WIFI_SECURITY_WPA3:      return "WPA3 SAE";
+		case WIFI_SECURITY_WPA3_WPA2: return "WPA3/WPA2 SAE";
+		default:                      return "WPA/WPA2 PSK";
+	}
+}
+
+static uint32_t wifi_security_auth(uint8_t security)
+{
+	switch (security)
+	{
+		case WIFI_SECURITY_WPA2_AES:  return CYW43_AUTH_WPA2_AES_PSK;
+		case WIFI_SECURITY_WPA3:      return CYW43_AUTH_WPA3_SAE_AES_PSK;
+		case WIFI_SECURITY_WPA3_WPA2: return CYW43_AUTH_WPA3_WPA2_AES_PSK;
+		default:                      return CYW43_AUTH_WPA2_MIXED_PSK;
+	}
+}
+
+static void platform_network_wifi_store_reconnect_credentials(const char *ssid, const char *password)
+{
+	if (ssid != NULL)
+		strlcpy(g_wifi_reconnect_ssid, ssid, sizeof(g_wifi_reconnect_ssid));
+	else
+		g_wifi_reconnect_ssid[0] = '\0';
+
+	if (password != NULL)
+		strlcpy(g_wifi_reconnect_password, password, sizeof(g_wifi_reconnect_password));
+	else
+		g_wifi_reconnect_password[0] = '\0';
+}
+
+static void platform_network_wifi_schedule_reconnect()
+{
+	if (g_wifi_reconnect_ssid[0] == '\0')
+		return;
+
+	g_wifi_scan_suspend_reconnect = false;
+	g_wifi_reconnect = true;
+}
+
+bool platform_network_supported()
+{
+	/* from cores/rp2040/RP2040Support.h */
+#if !defined(PICO_CYW43_SUPPORTED)
+	return false;
+#elif defined(ZULUSCSI_BLASTER)
+	return true;
+#else
+	extern bool __isPicoW;
+	return __isPicoW;
+#endif
+}
+
+bool platform_network_init(char *mac)
+{
+	pico_unique_board_id_t board_id;
+	uint8_t set_mac[6], read_mac[6];
+
+	if (!platform_network_supported())
+		return false;
+
+	// long signal blink at network initialization
+
+	// Set LED off and check if RM2 communication is working (returns 0 on success)
+	if (0 != cyw43_gpio_set(&cyw43_state, PICO_W_GPIO_LED_PIN, 0))
+		return false;
+	PICO_W_LED_ON();
+	delay(PICO_W_LONG_BLINK_DELAY);
+	PICO_W_LED_OFF();
+
+
+	logmsg(" ");
+	logmsg("=== Network Initialization ===");
+
+	memset(wifi_network_list, 0, sizeof(wifi_network_list));
+
+	cyw43_deinit(&cyw43_state);
+	cyw43_init(&cyw43_state);
+
+	if (mac == NULL || (mac[0] == 0 && mac[1] == 0 && mac[2] == 0 && mac[3] == 0 && mac[4] == 0 && mac[5] == 0))
+	{
+		mac = (char *)&set_mac;
+		memcpy(mac, defaultMAC, sizeof(set_mac));
+
+		// retain Dayna vendor but use a device id specific to this board
+		pico_get_unique_board_id(&board_id);
+
+		dbgmsg("Unique board id: ", board_id.id[0], " ", board_id.id[1], " ", board_id.id[2], " ", board_id.id[3], " ",
+									board_id.id[4], " ", board_id.id[5], " ", board_id.id[6], " ", board_id.id[7]);
+
+		if (board_id.id[3] != 0 && board_id.id[4] != 0 && board_id.id[5] != 0)
+		{
+			mac[3] = board_id.id[3];
+			mac[4] = board_id.id[4];
+			mac[5] = board_id.id[5];
+		}
+
+		memcpy(scsiDev.boardCfg.wifiMACAddress, mac, sizeof(scsiDev.boardCfg.wifiMACAddress));
+	}
+
+	// setting the MAC requires libpico to be compiled with CYW43_USE_OTP_MAC=0
+	memcpy(cyw43_state.mac, mac, sizeof(cyw43_state.mac));
+	cyw43_arch_enable_sta_mode();
+	cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, read_mac);
+	char mac_hex_string[4*6] = {0};
+	sprintf(mac_hex_string, "%02X:%02X:%02X:%02X:%02X:%02X", read_mac[0], read_mac[1], read_mac[2], read_mac[3], read_mac[4], read_mac[5]);
+	logmsg("Wi-Fi MAC: ", mac_hex_string);
+	if (memcmp(mac, read_mac, sizeof(read_mac)) != 0)
+		logmsg("WARNING: Wi-Fi MAC is not what was requested (", mac_hex_string,"), is libpico not compiled with CYW43_USE_OTP_MAC=0?");
+
+	network_in_use = true;
+
+	return true;
+}
+
+void platform_network_add_multicast_address(uint8_t *mac)
+{
+	int ret;
+
+	if ((ret = cyw43_wifi_update_multicast_filter(&cyw43_state, mac, true)) != 0)
+		logmsg( __func__, ": cyw43_wifi_update_multicast_filter: ", ret);
+}
+
+bool platform_network_wifi_join(char *ssid, char *password, bool reconnect)
+{
+	int ret;
+
+	if (!platform_network_supported())
+		return false;
+
+	platform_network_wifi_store_reconnect_credentials(ssid, password);
+	// Explicit join (e.g. SCSI command with new credentials) resets reconnect state
+	if (!reconnect)
+	{
+		wifi_reconnect_attempts = 0;
+		wifi_reconnect_interval = WIFI_RECONNECT_START_INTERVAL;
+		wifi_reconnect_time = millis();
+	}
+
+	g_wifi_join_secured = (password != NULL && password[0] != 0);
+
+	if (password == NULL || password[0] == 0)
+	{
+		if (!reconnect)
+			logmsg("Connecting to Wi-Fi SSID \"", ssid, "\" with no authentication");
+		ret = cyw43_arch_wifi_connect_async(ssid, NULL, CYW43_AUTH_OPEN);
+	}
+	else
+	{
+		uint8_t security = scsiDev.boardCfg.wifiSecurity;
+
+		if (!reconnect)
+			logmsg("Connecting to Wi-Fi SSID \"", ssid, "\" with ", wifi_security_name(security));
+		ret = cyw43_arch_wifi_connect_async(ssid, password, wifi_security_auth(security));
+	}
+
+	if (ret == 0)
+	{
+		// Time the association from the first attempt, not from every automatic
+		// retry, otherwise the backoff below always restarts the stall timer.
+		if (!reconnect || wifi_join_time == 0)
+		{
+			wifi_join_time = millis();
+			wifi_join_stall_reported = false;
+		}
+
+		// Short single blink at start of connection sequence
+		PICO_W_LED_OFF();
+		delay(PICO_W_SHORT_BLINK_DELAY);
+		PICO_W_LED_ON();
+		delay(PICO_W_SHORT_BLINK_DELAY);
+		PICO_W_LED_OFF();
+	}
+	else
+	{
+		logmsg("Error occurred starting the Wi-Fi interface to SSID ", ssid);
+	}
+	return (ret == 0);
+}
+
+void platform_network_poll()
+{
+	if (scsiDev.phase == BUS_FREE)
+	{
+		static uint32_t blink_start = 0;
+		static uint8_t blinks = 0;
+		if (g_blink_connected == BLINK_CONNECTED_ON)
+		{
+			blink_start =  millis();
+			blinks = 2 * PICO_W_BLINK_CONNECTED_TIMES;
+			g_blink_connected = BLINK_CONNECTED_ACTIVE;
+		}
+
+		if (g_blink_connected == BLINK_CONNECTED_ACTIVE && (uint32_t)(millis() - blink_start) > PICO_W_SHORT_BLINK_DELAY )
+		{
+			if (blinks & 1)
+			{
+				PICO_W_LED_ON();
+			}
+			else
+			{
+				PICO_W_LED_OFF();
+			}
+
+			if (blinks == 0)
+			{
+				g_blink_connected = BLINK_CONNECTED_OFF;
+			}
+			else
+			{
+				blink_start = millis();
+				--blinks;
+			}
+		}
+	}
+	if (g_wifi_scan_restore_connection && !cyw43_wifi_scan_active(&cyw43_state))
+	{
+		logmsg("Wi-Fi scan complete, reconnecting to \"", g_wifi_reconnect_ssid, "\"");
+		g_wifi_scan_restore_connection = false;
+		platform_network_wifi_schedule_reconnect();
+	}
+
+	static int last_network_status = CYW43_LINK_DOWN;
+	if (!network_in_use)
+		return;
+	int status = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+	char * ssid = (g_wifi_reconnect_ssid[0]) ? g_wifi_reconnect_ssid : scsiDev.boardCfg.wifiSSID;
+	if (status == CYW43_LINK_BADAUTH || status == CYW43_LINK_NONET || status == CYW43_LINK_FAIL || status == CYW43_LINK_NOIP)
+	{
+		if (last_network_status != status)
+		{
+			switch (status)
+			{
+				case CYW43_LINK_NOIP:
+					logmsg("Wi-Fi connected to ", ssid, " but was not assigned an IP");
+					break;
+				case CYW43_LINK_BADAUTH:
+					logmsg("Wi-Fi authentication failure connecting to \"", ssid, "\", please check the settings \"WiFiPassword\" and \"WiFiSecurity\" (currently ",
+						wifi_security_name(scsiDev.boardCfg.wifiSecurity), ") in ", CONFIGFILE);
+					break;
+				case CYW43_LINK_NONET:
+					logmsg("Wi-Fi SSID ", ssid, " not found, possible out of range or down");
+					break;
+				case CYW43_LINK_FAIL:
+					logmsg("Wi-Fi connection to ", ssid, " failed");
+					break;
+			}
+		}
+	}
+
+	if (g_wifi_reconnect
+		&& ssid[0] != '\0'
+		&& scsiDev.phase == BUS_FREE
+		&& (uint32_t)(millis() - wifi_reconnect_time) > wifi_reconnect_interval)
+	{
+		wifi_reconnect_time = millis();
+		wifi_reconnect_attempts++;
+		wifi_reconnect_interval += WIFI_RECONNECT_INCREMENT_INTERVAL;
+		if (wifi_reconnect_interval > WIFI_RECONECT_MAX_INTERVAL)
+			wifi_reconnect_interval = WIFI_RECONECT_MAX_INTERVAL;
+		logmsg("Attempting Wi-Fi reconnection to \"", ssid, "\" attempts: ", wifi_reconnect_attempts, ", next attempt in ", (int)wifi_reconnect_interval / 1000, " seconds");
+		platform_network_wifi_join(ssid, (g_wifi_reconnect_password[0]) ? g_wifi_reconnect_password : scsiDev.boardCfg.wifiPassword, true);
+
+	}
+
+	// An association that never completes sits at CYW43_LINK_JOIN forever
+	if (!wifi_join_stall_reported
+		&& wifi_join_time != 0
+		&& status == CYW43_LINK_JOIN
+		&& (uint32_t)(millis() - wifi_join_time) > WIFI_JOIN_STALL_TIMEOUT)
+	{
+		wifi_join_stall_reported = true;
+		logmsg("Wi-Fi association to \"", ssid, "\" has not completed after 30 seconds, if it does not connect check that \"WiFiSecurity\" (currently ",
+			wifi_security_name(scsiDev.boardCfg.wifiSecurity), ") in ", CONFIGFILE, " matches the access point");
+	}
+
+	last_network_status = status;
+
+	// TEMPORARY DIAGNOSTIC: log the raw link status every ~10s, unconditionally,
+	// regardless of what the keepalive condition below checks for. This is to
+	// directly observe what status value this device actually reports while
+	// idle, since the keepalive block's silence hasn't told us that on its own.
+	// Disabled for release; uncomment for diagnostics.
+#if 0
+	static uint32_t status_log_time = 0;
+	if ((uint32_t)(millis() - status_log_time) > 10000)
+	{
+		status_log_time = millis();
+		logmsg("DIAG: link status=", status, " network_in_use=", (int)network_in_use);
+	}
+#endif
+
+	// Periodically send a dummy Ethernet frame while associated. This is a
+	// workaround for CYW43 behavior observed on Aruba Instant APs: once the
+	// AP ages out and deauths an idle client, the chip does not appear to
+	// notice/recover on its own, even with power-save disabled - but it
+	// reliably does recover the next time the host attempts to transmit.
+	// Rather than rely on the SCSI host (e.g. classic Mac) happening to
+	// generate traffic often enough, proactively send a minimal broadcast
+	// frame on a timer, well under typical AP idle timeouts. The frame uses
+	// the IEEE-reserved "local experimental" EtherType (0x88B5) and an
+	// all-zero payload so it is inert to anything else on the network.
+	static uint32_t keep_alive_interval = 0;
+	static bool keep_alive_set = false;
+	if (!keep_alive_set)
+	{
+		keep_alive_set = true;
+		keep_alive_interval = g_scsi_settings.getSystem()->wifi_keep_alive_s * 1000;
+	}
+
+	static uint32_t wifi_keepalive_time = 0;
+	if (keep_alive_interval > 0
+		&& status >= CYW43_LINK_JOIN
+		&& (uint32_t)(millis() - wifi_keepalive_time) > keep_alive_interval)
+	{
+		wifi_keepalive_time = millis();
+
+		uint8_t keepalive_frame[60] = {0};
+		// Destination: broadcast
+		memset(&keepalive_frame[0], 0xFF, 6);
+		// Source: our own MAC
+		memcpy(&keepalive_frame[6], cyw43_state.mac, 6);
+		// EtherType: 0x88B5, IEEE Std 802 - Local Experimental Ethertype 1
+		keepalive_frame[12] = 0x88;
+		keepalive_frame[13] = 0xB5;
+		// Remaining bytes are zero-padding to meet minimum frame size
+
+		int ret = cyw43_send_ethernet(&cyw43_state, 0, sizeof(keepalive_frame), keepalive_frame, 0);
+		dbgmsg("Wi-Fi keepalive frame send attempt, status=", status, " ret=", ret);
+	}
+
+	cyw43_arch_poll();
+}
+
+int platform_network_send(uint8_t *buf, size_t len)
+{
+	int ret = cyw43_send_ethernet(&cyw43_state, 0, len, buf, 0);
+	if (ret != 0)
+		logmsg("cyw43_send_ethernet failed: ", ret);
+
+	return ret;
+}
+
+bool platform_network_iface_check()
+{
+	cyw43_deinit(&cyw43_state);
+	cyw43_init(&cyw43_state);
+	return 0 == cyw43_gpio_set(&cyw43_state, PICO_W_GPIO_LED_PIN, 1);
+}
+
+void platform_network_deinit()
+{
+	cyw43_init(&cyw43_state);
+	cyw43_gpio_set(&cyw43_state, PICO_W_GPIO_LED_PIN, 0);
+	cyw43_deinit(&cyw43_state);
+}
+
+static int platform_network_wifi_scan_result(void *env, const cyw43_ev_scan_result_t *result)
+{
+	struct wifi_network_entry *entry = NULL;
+
+	if (!result || !result->ssid_len || !result->ssid[0])
+		return 0;
+
+	for (int i = 0; i < WIFI_NETWORK_LIST_ENTRY_COUNT; i++)
+	{
+		// take first available
+		if (wifi_network_list[i].ssid[0] == '\0')
+		{
+			entry = &wifi_network_list[i];
+			break;
+		}
+		// or if we've seen this network before, use this slot
+		else if (strcmp((char *)result->ssid, wifi_network_list[i].ssid) == 0)
+		{
+			entry = &wifi_network_list[i];
+			break;
+		}
+	}
+
+	if (!entry)
+	{
+		// no available slots, insert according to our RSSI
+		for (int i = 0; i < WIFI_NETWORK_LIST_ENTRY_COUNT; i++)
+		{
+			if (result->rssi > wifi_network_list[i].rssi)
+			{
+				// shift everything else down
+				for (int j = WIFI_NETWORK_LIST_ENTRY_COUNT - 1; j > i; j--)
+					wifi_network_list[j] = wifi_network_list[j - 1];
+
+				entry = &wifi_network_list[i];
+				memset(entry, 0, sizeof(struct wifi_network_entry));
+				break;
+			}
+		}
+	}
+
+	if (entry == NULL)
+		return 0;
+
+	if (entry->rssi == 0 || result->rssi > entry->rssi)
+	{
+		entry->channel = result->channel;
+		entry->rssi = result->rssi;
+	}
+	if (result->auth_mode & 7)
+		entry->flags = WIFI_NETWORK_FLAG_AUTH;
+	strncpy(entry->ssid, (const char *)result->ssid, sizeof(entry->ssid));
+	entry->ssid[sizeof(entry->ssid) - 1] = '\0';
+	memcpy(entry->bssid, result->bssid, sizeof(entry->bssid));
+
+	return 0;
+}
+
+int platform_network_wifi_start_scan()
+{
+	if (cyw43_wifi_scan_active(&cyw43_state))
+		return -1;
+
+	int status = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+	if (status != CYW43_LINK_DOWN)
+	{
+		if (g_wifi_reconnect_ssid[0] == '\0' && scsiDev.boardCfg.wifiSSID[0] != '\0')
+			platform_network_wifi_store_reconnect_credentials(scsiDev.boardCfg.wifiSSID, scsiDev.boardCfg.wifiPassword);
+
+		if (g_wifi_reconnect_ssid[0] != '\0')
+		{
+			logmsg("Temporarily disconnecting from Wi-Fi SSID \"", g_wifi_reconnect_ssid, "\" to scan for hotspots");
+			g_wifi_scan_restore_connection = true;
+			g_wifi_scan_suspend_reconnect = true;
+			cyw43_arch_disable_sta_mode();
+			cyw43_arch_enable_sta_mode();
+		}
+		else
+		{
+			logmsg("Wi-Fi scan requested while connected, but reconnect credentials are not available");
+		}
+	}
+
+	cyw43_wifi_scan_options_t scan_options = { 0 };
+	memset(wifi_network_list, 0, sizeof(wifi_network_list));
+	int ret = cyw43_wifi_scan(&cyw43_state, &scan_options, NULL, platform_network_wifi_scan_result);
+	if (ret != 0)
+	{
+		logmsg("Failed to start Wi-Fi scan: ", ret);
+		if (g_wifi_scan_restore_connection)
+		{
+			g_wifi_scan_restore_connection = false;
+			platform_network_wifi_schedule_reconnect();
+		}
+	}
+
+	return ret;
+}
+
+int platform_network_wifi_scan_finished()
+{
+	return !cyw43_wifi_scan_active(&cyw43_state);
+}
+
+void platform_network_wifi_dump_scan_list()
+{
+	struct wifi_network_entry *entry = NULL;
+	
+	for (int i = 0; i < WIFI_NETWORK_LIST_ENTRY_COUNT; i++)
+	{
+		entry = &wifi_network_list[i];
+
+		if (entry->ssid[0] == '\0')
+			break;
+			
+		logmsg("wifi[",i,"] = ",entry->ssid,", channel ",(int)entry->channel,", rssi ",(int)entry->rssi,
+				", bssid ",(uint8_t) entry->bssid[0],":",(uint8_t) entry->bssid[1],":",(uint8_t) entry->bssid[2],":",
+				(uint8_t) entry->bssid[3],":",(uint8_t) entry->bssid[4],":",(uint8_t) entry->bssid[5],", flags ", entry->flags);
+	}
+}
+
+int platform_network_wifi_rssi()
+{
+	int32_t rssi = 0;
+
+    cyw43_ioctl(&cyw43_state, CYW43_IOCTL_GET_RSSI, sizeof(rssi), (uint8_t *)&rssi, CYW43_ITF_STA);
+	return rssi;
+}
+
+char * platform_network_wifi_ssid()
+{
+	struct ssid_t {
+		uint32_t ssid_len;
+		uint8_t ssid[32 + 1];
+	} ssid;
+	static char cur_ssid[32 + 1];
+
+	memset(cur_ssid, 0, sizeof(cur_ssid));
+
+	int ret = cyw43_ioctl(&cyw43_state, CYW43_IOCTL_GET_SSID, sizeof(ssid), (uint8_t *)&ssid, CYW43_ITF_STA);
+	if (ret)
+	{
+		logmsg("Failed getting Wi-Fi SSID: ", ret);
+		return NULL;
+	}
+
+	ssid.ssid[sizeof(ssid.ssid) - 1] = '\0';
+	if (ssid.ssid_len < sizeof(ssid.ssid))
+		ssid.ssid[ssid.ssid_len] = '\0';
+	
+	strlcpy(cur_ssid, (char *)ssid.ssid, sizeof(cur_ssid));
+	return cur_ssid;
+}
+
+char * platform_network_wifi_bssid()
+{
+	static char bssid[6];
+
+	memset(bssid, 0, sizeof(bssid));
+
+	/* TODO */
+
+	return bssid;
+}
+
+uint8_t platform_network_wifi_flags()
+{
+	if (!g_wifi_join_secured)
+		return 0;
+
+	// Only claim authentication for an association that actually happened
+	if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < CYW43_LINK_JOIN)
+		return 0;
+
+	return WIFI_NETWORK_FLAG_AUTH;
+}
+
+int platform_network_wifi_channel()
+{
+	int32_t channel = 0;
+
+    cyw43_ioctl(&cyw43_state, CYW43_IOCTL_GET_CHANNEL, sizeof(channel), (uint8_t *)&channel, CYW43_ITF_STA);
+	return channel;
+}
+
+// these override weakly-defined functions in pico-sdk
+
+void cyw43_cb_process_ethernet(void *cb_data, int itf, size_t len, const uint8_t *buf)
+{
+	scsiNetworkEnqueue(buf, len);
+}
+
+void cyw43_cb_tcpip_set_link_down(cyw43_t *self, int itf)
+{
+	if (g_wifi_scan_suspend_reconnect)
+	{
+		logmsg("Link down from Wi-Fi to scan for hotspots");
+		return;
+	}
+
+	logmsg("Link down from Wi-Fi SSID \"",  g_wifi_reconnect_ssid,"\" reconnecting");
+	g_wifi_reconnect = true;
+}
+
+void cyw43_cb_tcpip_set_link_up(cyw43_t *self, int itf)
+{
+	char *ssid = platform_network_wifi_ssid();
+
+	// The link is genuinely up, so stop watching for a stalled association.
+	wifi_join_time = 0;
+	wifi_join_stall_reported = false;
+
+	if (ssid)
+	{
+		int32_t rssi;
+		cyw43_wifi_get_rssi(&cyw43_state, &rssi);
+		logmsg("Successfully connected to Wi-Fi SSID \"",ssid,"\" with signal strength ", (int) rssi,  "dBm");
+		wifi_reconnect_attempts = 0;
+		wifi_reconnect_interval = WIFI_RECONNECT_START_INTERVAL;
+		g_blink_connected = BLINK_CONNECTED_ON;
+		g_wifi_reconnect = false;
+	}
+}
+
+}
+#else
+bool platform_network_supported() { return false; }
+#endif // ZULUSCSI_NETWORK

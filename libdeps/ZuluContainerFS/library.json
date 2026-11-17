@@ -1,0 +1,13 @@
+{
+    "name": "ZuluContainerFS",
+    "version": "2025.12.12",
+    "description": "Seamless image data access of container formats based on top of SdFat's FsFile class",
+    "repository": { "type": "git", "url": "https://github.com/rabbitholecomputing/ZuluContainerFS.git"},
+    "authors": [
+        { "name": "J. Morio Sakaguchi", "email": "morio.earth@gmail.com" },
+        { "name": "Rabbit Hole Computing", "email": "inquiries@rabbitholecomputing.com", "url": "https://www.rabbitholecomputing.com/" }
+    ],
+    "license": "MIT",
+    "frameworks": "*",
+    "platforms": "*"
+}

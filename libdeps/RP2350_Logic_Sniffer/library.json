@@ -1,0 +1,16 @@
+{
+    "name": "RP2350_Logic_Sniffer",
+    "version": "1.1.0",
+    "description": "Logic signal capture on RP2350 with run-length encoding support.",
+    "repository": { "type": "git", "url": "https://github.com/rabbitholecomputing/RP2350_Logic_Sniffer.git"},
+    "authors": [
+        { "name": "Petteri Aimonen", "email": "jpa@git.mail.kapsi.fi" },
+        { "name": "Rabbit Hole Computing", "email": "inquiries@rabbitholecomputing.com", "url": "https://www.rabbitholecomputing.com/" }
+    ],
+    "license": "MIT",
+    "frameworks": "*",
+    "platforms": "*",
+    "build": {
+        "srcDir": "lib/RP2350_Logic_Sniffer/"
+    }
+}
